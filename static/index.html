@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Bridge 2.3 · 外部任务连接器</title><link rel="stylesheet" href="/static/style.css"></head>
+<body>
+<section id="startupNotice" style="max-width:520px;margin:12vh auto;padding:28px;font:15px/1.7 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;color:#171717;background:#fff;border:1px solid #e7e5e4;border-radius:16px">
+  <h1 style="font-size:22px;margin:0 0 12px">打开 Codex Bridge 2.3</h1>
+  <p>面板需要通过本机服务打开。直接打开 HTML 源文件无法加载完整界面和连接状态。</p>
+  <a href="http://127.0.0.1:8797/panel" style="display:inline-block;margin:8px 0;padding:10px 16px;border-radius:10px;background:#111;color:#fff;text-decoration:none">打开本机面板</a>
+  <p style="font-size:13px;color:#737373">如果已通过服务打开，请刷新页面；仍未加载时，请检查 Bridge 服务是否正在运行。</p>
+</section>
+<div id="panelRoot" hidden>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">CB</div><div class="brand-copy"><div class="brand-text">Codex Bridge 2.3</div><div class="brand-sub">本机飞书接入</div></div></div>
+    <nav class="nav"><button id="navTasks" class="active" data-page="tasks" aria-label="任务" title="任务"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 6.5h14M5 12h14M5 17.5h9"/></svg><span>任务</span></button><button id="navConnections" data-page="connections" aria-label="连接" title="连接"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 12h8M12 8v8"/><rect x="3" y="3" width="18" height="18" rx="5"/></svg><span>连接</span></button><button id="navFeishu" data-page="feishu" aria-label="飞书" title="飞书"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16v12H4zM4 8l8 6 8-6"/></svg><span>飞书</span></button><button id="navRoutes" data-page="routes" aria-label="群流程" title="群流程"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="16" width="7" height="5" rx="1.5"/><path d="M6.5 8v8a2.5 2.5 0 0 0 2.5 2.5h5M10 5.5h5a2.5 2.5 0 0 1 2.5 2.5v8"/></svg><span>群流程</span></button><button id="navCards" data-page="cards" aria-label="卡片" title="卡片"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 9h18M7 13h6M7 16h4"/></svg><span>卡片</span></button></nav>
+  </aside>
+  <main class="main"><header class="topbar"><div class="title-wrap"><h1 id="pageTitle">任务</h1><p id="pageSubtitle">外部系统交给 Codex 的任务。</p></div><div class="top-actions"><button class="btn primary hidden" id="primaryAction">+ 创建连接</button></div></header>
+  <section class="content"><div class="content-inner">
+    <div id="serviceNotice" class="service-notice hidden" role="status" aria-live="polite"><span id="serviceNoticeText"></span><button class="btn" id="retryRefresh" type="button">重试</button></div>
+    <div id="tasksPage"><div id="firstUseEmpty" class="hidden"><div class="empty-card" style="padding:44px 34px;text-align:left;background:#fff"><div style="font-size:20px;font-weight:750;letter-spacing:-.03em;margin-bottom:8px"><span id="firstUseTitle">还没有外部任务</span></div><div id="firstUseDescription" style="font-size:13px;color:var(--muted);line-height:1.7;max-width:520px">连接飞书机器人后，可以直接在飞书里给 Codex 派任务。</div><button class="btn primary" style="margin-top:18px" id="firstConnect">连接飞书机器人</button> <button class="btn" style="margin-top:18px" id="firstOtherConnect">连接其他工具</button></div></div>
+      <div id="taskContent" class="hidden"><section id="attentionSection"><div class="section-title" style="margin-top:0"><h2>需要你处理</h2><span id="attentionCount"></span></div><div class="task-list" id="attentionList"></div></section><div class="section-title"><h2>最近任务</h2><span id="recentCount"></span></div><div class="task-list" id="recentList"></div><button class="history-toggle hidden" id="historyToggle"><span>历史任务</span><span id="historyChevron">›</span></button><div id="historyList" class="hidden"><div class="task-list" id="historyItems"></div></div></div>
+    </div>
+    <div id="connectionsPage" class="hidden"><div class="toolbar"><div><div style="font-size:14px;font-weight:700">谁可以给哪个 Codex 项目派任务</div><div style="font-size:12px;color:var(--muted);margin-top:5px">每个连接只对应一个项目。</div></div></div><div class="connections-grid" id="connectionsGrid"></div></div>
+    <div id="routesPage" class="hidden"><div class="toolbar"><div><strong>按群设置处理流程</strong><p class="config-help">直接告诉 Codex：“给翻译群加审核卡，通过后继续配音。”它会匹配现有资源、检查并保存。这里查看流程和执行进度。</p></div><button class="btn primary" id="addRoute">创建流程的方法</button></div><div id="routesGrid" class="connections-grid"></div><h3>流程进度</h3><div id="workflowRuns"></div><p class="config-help">新群先在“飞书”页完成配对，再回到这里选择。机器人使用同一个 OpenClaw 应用。</p></div>
+    <div id="cardsPage" class="hidden">
+      <section class="card-intent">
+        <div class="card-eyebrow">用对话创建和修改</div><h2>你想让这张卡片做什么？</h2>
+        <p class="config-help">描述审核内容、需要的选择，以及通过后做什么。Codex 会配置好，结果直接出现在下面。</p>
+        <form id="cardIntentForm">
+          <div class="field"><label for="cardIntentGroup">用于哪个群</label><select id="cardIntentGroup" class="select"></select></div>
+          <label class="sr-only" for="cardIntentText">卡片需求</label><textarea id="cardIntentText" class="input" rows="3" maxlength="4000" placeholder="例如：审核英文文档，默认选示例音色，素材随音色绑定。通过后继续配音，有意见就按文档评论修改。"></textarea>
+          <div class="card-examples"><button type="button" class="btn ghost" data-card-example="voice">默认示例音色</button><button type="button" class="btn ghost" data-card-example="revise">支持退回修改</button><button type="button" class="btn ghost" data-card-example="new">增加审核卡</button></div>
+          <div class="card-intent-actions"><span id="cardIntentHint" class="config-help">配置应用于新任务。</span><button class="btn primary" id="submitCardIntent" type="submit">交给 Codex 配置</button></div>
+          <div id="cardIntentFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div>
+        </form>
+        <section id="cardAssistantConversation" class="hidden" aria-live="polite"></section>
+      </section>
+      <div class="section-title"><h2>当前卡片</h2><span>展示已保存的设置</span></div><div id="cardsGrid" class="connections-grid"></div>
+      <details class="config-section"><summary>发送与审核记录</summary><div id="cardDeliveries"></div></details>
+    </div>
+    <div id="feishuPage" class="hidden"><div class="toolbar"><div><div style="font-size:14px;font-weight:700">飞书接入向导</div><div style="font-size:12px;color:var(--muted);margin-top:5px">应用凭据验证、机器人识别和身份配对在这里完成。</div></div><span id="feishuRuntime" class="status wait">未配置</span></div>
+      <section class="empty-card" style="max-width:720px;padding:24px;text-align:left;margin-bottom:16px">
+        <div class="wizard-heading"><strong>1 · 连接飞书应用</strong><span id="appStepState" class="step-state">待配置</span></div>
+        <p style="font-size:12px;line-height:1.6;margin:0 0 16px">在<a href="https://open.feishu.cn/app" target="_blank" rel="noopener">飞书开发者后台</a>创建企业自建应用，复制 App ID 和 App Secret。这里会验证凭据、识别机器人，并为选中的 Codex 项目自动创建连接。</p>
+        <div class="field"><label for="quickAppId">App ID</label><input class="input" id="quickAppId" placeholder="cli_..." autocomplete="off"></div>
+        <div class="field"><label for="quickSecret">App Secret</label><input class="input" id="quickSecret" type="password" placeholder="已保存则留空" autocomplete="new-password"></div>
+        <div class="field"><label for="quickProject">Codex 项目</label><select class="select" id="quickProject"></select></div>
+        <div class="wizard-actions"><button class="btn primary" id="quickSetup" type="button">验证并保存</button></div>
+        <div id="quickStatus" style="font-size:12px;line-height:1.7;margin-top:14px"></div>
+        <div id="quickSetupFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div>
+      </section>
+      <section class="empty-card" style="max-width:720px;padding:24px;text-align:left;margin-bottom:16px">
+        <div class="wizard-heading"><strong>2 · 完成飞书后台设置</strong><span id="botStepState" class="step-state">待检查</span></div>
+        <p style="font-size:12px;line-height:1.7;margin:0">启用机器人；在“事件与回调”选择<strong>使用长连接接收事件</strong>，添加 <code>im.message.receive_v1</code>。私聊开通 <code>im:message.p2p_msg:readonly</code>，群聊还需 <code>im:message.group_at_msg:readonly</code>，回复需 <code>im:message:send_as_bot</code>。最后发布应用。<a href="https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case" target="_blank" rel="noopener">长连接指引</a> · <a href="https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/subscription-event-case" target="_blank" rel="noopener">事件与发布指引</a></p>
+        <button class="btn" id="quickCheck" type="button" style="margin-top:14px">检查机器人状态</button>
+        <div id="quickBotStatus" style="font-size:12px;line-height:1.7;margin-top:10px"></div>
+        <div id="quickCheckFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div>
+      </section>
+      <section class="empty-card" style="max-width:720px;padding:24px;text-align:left;margin-bottom:16px">
+        <div class="wizard-heading"><strong>3 · 在飞书里配对</strong><span id="pairStepState" class="step-state">待配对</span></div>
+        <p style="font-size:12px;line-height:1.7;margin:0 0 12px">向机器人私聊发送面板生成的配对码，即可自动识别你的 Open ID。群聊配对时需先将机器人加群并 @ 它。配对码只用于识别身份，不会创建 Codex 任务。</p>
+        <p style="font-size:12px;line-height:1.7;margin:0 0 12px;color:#9a3412">若旧电脑仍在使用这个飞书应用，请先用独立测试应用；多条长连接会分流事件，切换原有订阅方式也会影响旧连接器。</p>
+        <button class="btn primary" id="quickPair" type="button">生成配对码并启动接收</button>
+        <div id="quickPairStatus" style="font-size:12px;line-height:1.7;margin-top:12px"></div>
+        <div id="quickPairFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div>
+      </section>
+      <details style="max-width:720px"><summary class="btn" style="display:list-item;padding:12px 16px">高级设置：允许名单、Prompt 模板和连接</summary>
+      <form id="feishuForm" class="empty-card" style="padding:24px;text-align:left;margin-top:10px">
+        <div class="field"><label for="feishuAppId">飞书 App ID</label><input class="input" id="feishuAppId" placeholder="cli_..." autocomplete="off"></div>
+        <div class="field"><label for="feishuSecret">App Secret</label><input class="input" id="feishuSecret" type="password" placeholder="留空则保留已保存的密钥" autocomplete="new-password"><div id="feishuSecretHint" style="font-size:11px;color:var(--muted);margin-top:5px"></div></div>
+        <div class="field"><label for="feishuConnection">投递到 Bridge 连接</label><select class="select" id="feishuConnection"></select></div>
+        <div class="field"><label for="feishuUsers">允许发送任务的用户 Open ID</label><textarea class="input" id="feishuUsers" rows="3" placeholder="每行一个 ou_...，未列出的用户不会触发任务"></textarea></div>
+        <div class="field"><label for="feishuChats">允许的群 Chat ID（可选）</label><textarea class="input" id="feishuChats" rows="2" placeholder="每行一个 oc_...；群内还需 @ 机器人"></textarea></div>
+        <div class="field"><label for="feishuBotId">机器人 Open ID（启用群聊时必填）</label><input class="input" id="feishuBotId" placeholder="ou_..."></div>
+        <div class="field"><label for="feishuPrompt">交给 Codex 的 Prompt 模板</label><textarea class="input" id="feishuPrompt" rows="7" spellcheck="false" placeholder="请处理这条飞书消息：&#10;{{message}}"></textarea><div style="font-size:11px;color:var(--muted);margin-top:5px">必须恰好包含一次 <code>{{message}}</code>。每条飞书消息会替换这个变量；回复已有消息时继续原 Codex 会话。</div></div>
+        <div class="field"><label for="feishuSample">模板预览 · 示例飞书消息</label><input class="input" id="feishuSample" value="请检查今天的项目进度" autocomplete="off"><div id="feishuPromptPreview" class="cred" style="white-space:pre-wrap;word-break:break-word;margin-top:9px" aria-live="polite"></div></div>
+        <div class="field"><label><input type="checkbox" id="feishuEnabled"> 启用本机飞书长连接</label></div>
+        <p style="font-size:12px;color:var(--muted);line-height:1.6">当前只接收文字消息。飞书侧仍需启用机器人、订阅接收消息事件并发布应用。此设置只在本机面板开放。</p>
+        <button class="btn primary" id="advancedSave" type="submit">保存飞书设置</button>
+        <div id="advancedFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div>
+      </form>
+      </details>
+    </div>
+  </div></section></main>
+</div>
+<div class="overlay" id="overlay"></div>
+<aside class="drawer" id="drawer"><div class="drawer-head"><strong id="drawerHeading">任务详情</strong><button class="icon-btn" id="closeDrawer" aria-label="关闭">✕</button></div><div class="drawer-body" id="drawerBody"></div><div id="drawerFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div></aside>
+<div class="modal" id="modal"><div class="modal-head"><div class="modal-title">创建连接</div><button class="icon-btn" id="closeModal" aria-label="关闭">✕</button></div><div class="modal-body"><div class="steps"><div class="step active" id="stepBar1"></div><div class="step" id="stepBar2"></div></div><div id="step1"><div class="hero-copy"><h2>创建连接</h2><p>告诉我们谁会发任务，以及这些任务应该进入哪个 Codex 项目。</p></div><div class="field"><label for="sourceName">任务来源</label><input class="input" id="sourceName" placeholder="例如：守望系统、手机助手、自动化脚本"></div><div class="field"><label for="projectSelect">Codex 项目</label><select class="select" id="projectSelect"></select></div><div class="field"><label style="color:var(--muted);font-weight:500">连接关系</label><div class="project-option selected" style="cursor:default"><div class="project-info"><strong id="routePreview"></strong><span>这个来源以后只能给这个项目派任务</span></div><span>✓</span></div></div><div id="connectionFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div></div><div id="step2" class="hidden"><div class="hero-copy"><h2>连接已创建</h2><p>把连接信息交给任务来源。第一条真实任务进入 Codex 后，状态会自动变成“可用”。</p></div><div class="project-option selected" style="cursor:default;margin-top:18px"><div class="project-info"><strong id="finalRoute"></strong><span>等待第一条真实任务验证</span></div><div class="status wait"><span class="s-dot"></span>待验证</div></div><button class="btn primary" style="width:100%;justify-content:center;margin-top:14px" id="copyNew">复制连接信息</button><div style="font-size:11px;color:var(--muted);margin-top:10px;text-align:center">复制后去任务来源完成配置；你也可以稍后再设置。</div><div style="margin-top:10px;text-align:center"><button class="mini-link" id="showNewTechnical">查看技术信息</button></div><div id="newTechnical" class="hidden cred"></div></div></div><div class="modal-foot"><button class="btn ghost" id="backBtn">返回</button><div style="display:flex;gap:8px"><button class="btn" id="cancelBtn">取消</button><button class="btn primary" id="nextBtn">创建连接</button></div></div></div>
+<div class="toast" id="toast"></div></div><script src="/static/app.js"></script><script src="/static/flows.js"></script><script src="/static/cards.js"></script></body></html>

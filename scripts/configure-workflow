@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Conversation configuration fallback when the live session lacks refreshed MCP tools."""
+import argparse
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mcp_server import fetch, post
+
+p = argparse.ArgumentParser(description='Read or configure a paired Feishu group workflow')
+g = p.add_mutually_exclusive_group(required=True)
+g.add_argument('--context', action='store_true')
+g.add_argument('--file', help='JSON arguments file, or - for stdin; dry_run defaults to true')
+a = p.parse_args()
+try:
+    if a.context:
+        result = fetch('/api/feishu/workflow-context')
+    else:
+        value = json.load(sys.stdin) if a.file == '-' else json.loads(Path(a.file).read_text())
+        result = post('/api/feishu/configure-workflow', value)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)

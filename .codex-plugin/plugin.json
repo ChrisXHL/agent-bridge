@@ -1,0 +1,25 @@
+{
+  "name": "codex-bridge-v2",
+  "version": "2.3.0",
+  "description": "Configure Feishu review workflows through Codex conversation",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Bridge 2.3",
+    "shortDescription": "外部任务连接器",
+    "longDescription": "通过对话维护飞书多阶段流程，记录审核版本、产物和回执，并在原 Codex 任务继续。",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "打开 Codex Bridge 面板",
+      "查看外部任务"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

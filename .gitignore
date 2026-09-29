@@ -1,0 +1,18 @@
+# Private local state must never be published
+.env
+.env.*
+!.env.example
+projects.json
+feishu.json
+*.sqlite*
+*.db
+*.log
+*.jsonl
+__pycache__/
+*.pyc
+.venv/
+data/
+backups/
+artifacts/
+.supervision*/
+.DS_Store

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+label=dev.codex.bridge.v2
+launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/$label.plist"
+echo "Codex Bridge 2.0 background receiver removed; local data was kept."

@@ -1,0 +1,222 @@
+{
+  "name": "字幕翻译、审核与配音",
+  "steps": [
+    {
+      "id": "translate",
+      "name": "翻译并创建审核文档",
+      "kind": "agent",
+      "needs": [],
+      "prompt": "使用 feishu-subtitle-dubbing 翻译准备步骤和 fcpxml-subtitle-aligner：保留最早原件，extract 字幕清单；严格监督逐条翻译，创建一条字幕一个段落的英文飞书文档，读取真实段落 ID 后 bind 清单。提交原件、绑定清单、文档及监督报告；Bridge 自动发审核卡，本轮结束。",
+      "produces": {
+        "original_fcpxml": {
+          "kind": "file"
+        },
+        "subtitle_manifest": {
+          "kind": "subtitle_manifest",
+          "reference": "original_fcpxml",
+          "document": "review_document"
+        },
+        "review_document": {
+          "kind": "feishu_document"
+        },
+        "translation_supervision": {
+          "kind": "file"
+        }
+      },
+      "next": "review",
+      "skills": [
+        "feishu-subtitle-dubbing",
+        "42how-feishu-cli",
+        "automotive-zh-en-subtitle-translator",
+        "strict-supervisor:supervise",
+        "fcpxml-subtitle-aligner"
+      ],
+      "acceptance": [
+        "最初的 FCPXML 保留原件及 SHA-256，逐条字幕建立稳定映射。",
+        "英文文档只保留字幕内容，逐字幕单元对应，不合并或遗漏。",
+        "严格监督结果为 passed，保存本轮监督报告；未通过时停止。",
+        "清单由工具提取并绑定真实飞书段落 ID；Bridge 从原件和文档快照重新核对。"
+      ],
+      "settings": {
+        "飞书身份配置": "default",
+        "文档读写身份": "user"
+      }
+    },
+    {
+      "id": "review",
+      "name": "审核译文并选择音色",
+      "kind": "review",
+      "needs": [
+        "review_document"
+      ],
+      "form_card": "voice_review",
+      "reviewers": [
+        "initiator"
+      ],
+      "next": "align",
+      "revise": "revise",
+      "skills": [],
+      "acceptance": [
+        "由原任务发起人在飞书审核，默认示例音色，素材和音色绑定提交。",
+        "点击通过时重新核对正文与评论版本；变化则暂停，不能批准另一个版本。",
+        "提交修改意见后进入修订，修订完成必须再次审核。"
+      ]
+    },
+    {
+      "id": "revise",
+      "name": "根据文档评论修改译文",
+      "kind": "agent",
+      "needs": [
+        "original_fcpxml",
+        "subtitle_manifest",
+        "review_document"
+      ],
+      "prompt": "使用 feishu-subtitle-dubbing 读取完整评论，按绑定段落 ID 局部修订，不覆盖整篇或更换段落 ID。严格监督后更新并读回，核对数量、顺序及绑定；缺失、拆行、重排或意见冲突则暂停。提交新版文档与修订/监督报告，再次等待审核。",
+      "produces": {
+        "review_document": {
+          "kind": "feishu_document"
+        },
+        "revision_report": {
+          "kind": "file"
+        },
+        "revision_supervision": {
+          "kind": "file"
+        }
+      },
+      "next": "review",
+      "skills": [
+        "feishu-subtitle-dubbing",
+        "42how-feishu-cli",
+        "lark-doc",
+        "lark-drive",
+        "automotive-zh-en-subtitle-translator",
+        "strict-supervisor:supervise",
+        "fcpxml-subtitle-aligner"
+      ],
+      "acceptance": [
+        "读取正文及全部未解决评论和回复分页，按字幕单元落实并记录处理结果。",
+        "无法定位、意见冲突或权限不足时暂停，不把读取失败当作无意见。",
+        "修订再次严格监督并保存 passed 报告；更新文档读回后重新等待审核。"
+      ],
+      "settings": {
+        "飞书身份配置": "default",
+        "文档读写身份": "user"
+      }
+    },
+    {
+      "id": "align",
+      "name": "按原始 FCPXML 对齐字幕",
+      "kind": "agent",
+      "needs": [
+        "original_fcpxml",
+        "subtitle_manifest",
+        "review_document"
+      ],
+      "prompt": "使用 fcpxml-subtitle-aligner 的 apply/verify，以账本最初原件、已绑定清单、已批准正文快照逐条回填。提交英文 FCPXML 与工具生成的 subtitle_alignment 报告；Bridge 重新核对文字对应及完整结构。无法匹配或发现语义问题先暂停，不能改批准稿。",
+      "produces": {
+        "translated_fcpxml": {
+          "kind": "fcpxml",
+          "reference": "original_fcpxml"
+        },
+        "timeline_report": {
+          "kind": "subtitle_alignment",
+          "reference": "original_fcpxml",
+          "manifest": "subtitle_manifest",
+          "document": "review_document",
+          "output": "translated_fcpxml"
+        }
+      },
+      "next": "tts",
+      "skills": [
+        "feishu-subtitle-dubbing",
+        "automotive-zh-en-subtitle-translator",
+        "fcpxml-subtitle-aligner"
+      ],
+      "acceptance": [
+        "只使用最初的 FCPXML 和字幕映射作为时间依据，不选择文件夹里最新的文件。",
+        "逐字幕替换英文，保留 offset/start/duration 有理数、节点结构、资源和样式。",
+        "输出逐条对应报告；未在 Final Cut 实际导入时，不声称已验证导入。",
+        "逐条英文必须与已批准段落精确一致，Bridge 独立重算；报告写 passed 不代表自动通过。"
+      ]
+    },
+    {
+      "id": "tts",
+      "name": "生成并对齐配音",
+      "kind": "agent",
+      "needs": [
+        "original_fcpxml",
+        "subtitle_manifest",
+        "review_document",
+        "translated_fcpxml",
+        "timeline_report"
+      ],
+      "prompt": "使用 feishu-subtitle-dubbing 与 dashscope-voice-clone-tts 的 audio_timeline.py：prepare 生成逐段文本和槽位，按 choices.voice 绑定素材复用匹配音色。每段按 Skill 的 effect_begin/finish 回执契约调用真实合成；成功复用，未知暂停。assemble 实测和拼接，超时禁止裁音/变速/改审核稿，需要改词回审核。提交成品和 audio_alignment 报告；Bridge 重新实测、重建并核对成功回执。\n配音分组升级：使用 feishu-subtitle-dubbing 与 dashscope-voice-clone-tts 的 audio_timeline.py，prepare/collect/assemble 均传 --grouping sentence/v1。保持每条批准字幕及映射，以连续语句组配音；先查看 preflight 风险并优先实测紧张语句。按 choices.voice 绑定素材复用音色。每组登记 effect_begin/finish 真实回执；成功复用，未知暂停。assemble 实测并拼接，组超时用 fail 记录 TIME_CONFLICT，再 request_revision 自动进入修订；先改稿、严格监督及预览测时，再请用户确认完成的新版；禁止裁音、变速或改批准稿。提交音频和 audio-alignment/v2 报告；Bridge 重算所有字幕覆盖、分组、时长及成功回执。",
+      "produces": {
+        "audio": {
+          "kind": "file"
+        },
+        "audio_alignment_report": {
+          "kind": "audio_alignment",
+          "alignment": "timeline_report",
+          "output": "audio"
+        }
+      },
+      "next": "deliver",
+      "skills": [
+        "feishu-subtitle-dubbing",
+        "dashscope-voice-clone-tts"
+      ],
+      "acceptance": [
+        "只使用审核选择的音色及绑定素材；复用音色前核对模型和素材身份。",
+        "超长段需要实质改稿时回到审核，不能悄悄改已批准文稿。",
+        "克隆与逐段合成登记真实回执，成功结果复用，不确定时暂停核对。",
+        "Bridge 从保留的分段音频重新解码、核对采样点、重建成品，并核对每段真实请求回执及音频哈希。",
+        "字幕内容、逐条段落映射和显示时间保留；每条字幕恰好属于一个连续语句组。",
+        "组内配音可跨字幕切换点；按组原起点放置，组间不重叠，不裁音、不变速。",
+        "preflight 是估算，不能代替真实合成测时；语句组超时记录 TIME_CONFLICT，需要改稿再审核。",
+        "克隆与每组合成登记真实回执，成功结果复用，不确定时先核对。",
+        "Bridge 重算映射、组文本、采样点及成品；逐词强制对齐、听感和 Final Cut 导入另行如实记录。"
+      ],
+      "settings": {
+        "合成模型": "cosyvoice-v3.5-plus",
+        "输出格式": "MP3",
+        "音色来源": "以本次审核卡的选择及绑定素材为准",
+        "新建音色预处理": "开启；参考音频最长取 20 秒",
+        "密钥来源": "按 Skill 从本机钥匙串注入，不写入流程配置",
+        "时间轴拼接": "48 kHz 单声道；按语句组原起点放置，组间补静音；字幕显示时间不变；不裁音、不变速",
+        "配音分段": "sentence/v1"
+      }
+    },
+    {
+      "id": "deliver",
+      "name": "将音频和英文 FCPXML 发回飞书",
+      "kind": "agent",
+      "needs": [
+        "review_document",
+        "audio",
+        "audio_alignment_report",
+        "translated_fcpxml"
+      ],
+      "prompt": "按 feishu-subtitle-dubbing 交付：核对时间轴和逐段音频报告，以 OpenClaw 身份将账本中的音频和英文 FCPXML 发送到原任务 chat_id。上传与发消息分别用 effect_begin 登记，已成功的结果直接复用；不重复合成。提交真实消息 ID 和 file_key，Bridge 读回核验原会话附件。说明评论处理、音色、时间校验与未实际完成的导入测试。",
+      "produces": {
+        "delivery": {
+          "kind": "delivery"
+        }
+      },
+      "skills": [
+        "feishu-subtitle-dubbing",
+        "42how-feishu-cli",
+        "lark-im"
+      ],
+      "acceptance": [
+        "核对音频和英文 FCPXML 的文件身份及时间轴报告。",
+        "回复原任务的飞书会话，以真实消息 ID 和 file_key 读回核对附件。",
+        "发送失败保留本地文件和回执，只恢复交付，不重复合成。"
+      ],
+      "settings": {
+        "飞书身份配置": "default",
+        "文档读写身份": "以 OpenClaw 应用上传、回复原会话"
+      }
+    }
+  ]
+}

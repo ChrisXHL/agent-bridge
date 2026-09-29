@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Codex/Skill CLI for the same card tool exposed through MCP."""
+import argparse,json,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
+from mcp_server import fetch,send_card
+p=argparse.ArgumentParser(description='发送已配置的飞书卡片，关联原任务')
+p.add_argument('--list',action='store_true');p.add_argument('--deliveries',action='store_true')
+p.add_argument('--source-message-id');p.add_argument('--card-type');p.add_argument('--variables-json');p.add_argument('--request-id')
+a=p.parse_args()
+try:
+ if a.list: result={'cards':fetch('/api/feishu').get('cards',[])}
+ elif a.deliveries: result={'cards':fetch('/api/feishu/card-deliveries')}
+ else:
+  if not all((a.source_message_id,a.card_type,a.variables_json,a.request_id)):p.error('请填写来源消息、卡片标识、变量 JSON 和 request-id')
+  result=send_card({'source_message_id':a.source_message_id,'card_type':a.card_type,'variables':json.loads(a.variables_json),'request_id':a.request_id})
+ print(json.dumps(result,ensure_ascii=False,indent=2))
+except Exception as e:
+ print(str(e),file=sys.stderr);sys.exit(1)
