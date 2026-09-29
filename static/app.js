@@ -1,7 +1,7 @@
 const $ = id => document.getElementById(id);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const savedPage=sessionStorage.getItem('bridgePage');
-const state = {page:['tasks','connections','feishu','routes','cards'].includes(savedPage)?savedPage:'tasks', projects:[], connections:[], tasks:[], workflowRuns:[], feishu:null, feishuDirty:false, quickDirty:false, newConnection:null, history:false, drawer:null, pending:{setup:false,check:false,pair:false,advanced:false,connection:false,approval:false}};
+const state = {page:['tasks','connections','feishu'].includes(savedPage)?savedPage:'tasks', projects:[], connections:[], tasks:[], feishu:null, feishuDirty:false, promptDirty:false, quickDirty:false, newConnection:null, history:false, drawer:null, pending:{setup:false,check:false,pair:false,advanced:false,connection:false,approval:false}};
 const statusClass = s => ({'等待 Codex':'wait','执行中':'run','流程进行中':'run','等待审核':'need','流程受阻':'need','需要你处理':'need','已完成':'done','失败':'fail','已停止':'fail','待验证':'wait','可用':'done','已停用':'fail'})[s] || 'wait';
 const badge = s => `<span class="status ${statusClass(s)}"><span class="s-dot"></span>${esc(s)}</span>`;
 const timeText = ts => new Date(ts*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
@@ -17,13 +17,9 @@ async function api(path, options={}) {
 function toast(message) { $('toast').textContent=message; $('toast').classList.add('show'); clearTimeout(window.toastTimer); window.toastTimer=setTimeout(()=>$('toast').classList.remove('show'),2500); }
 function feedback(id, message='', tone='info') { const element=$(id); element.textContent=message; element.className='inline-feedback'+(message?' '+tone:' hidden'); }
 function stepState(id, label, tone='') { const element=$(id); element.textContent=label; element.className='step-state'+(tone?' '+tone:''); }
-function switchPage(page) { state.page=page; sessionStorage.setItem('bridgePage',page); for(const name of ['tasks','connections','feishu','routes','cards']) { $(name+'Page').classList.toggle('hidden',page!==name); $('nav'+name[0].toUpperCase()+name.slice(1)).classList.toggle('active',page===name); } $('pageTitle').textContent=({tasks:'任务',connections:'连接',feishu:'飞书',routes:'群流程',cards:'卡片'})[page]; $('pageSubtitle').textContent=({tasks:'外部系统交给 Codex 的任务。',connections:'管理谁可以给哪些 Codex 项目派任务。',feishu:'在这台 Mac 上直接接收飞书消息。',routes:'不同群使用各自的项目与处理步骤。',cards:'描述需求，让 Codex 配置卡片。'})[page]; $('primaryAction').classList.toggle('hidden',page!=='connections'); if(page==='feishu') renderFeishu(); if(window.renderConfigPages)window.renderConfigPages(); }
-const workflowForTask=t=>state.workflowRuns.find(r=>r.task_id===t.id);
-function taskStatus(t){
- const run=workflowForTask(t);
- return ({blocked:'流程受阻',waiting_review:'等待审核',checking_review:'等待审核',running:'流程进行中',completed:'已完成',cancelled:'已停止'})[run?.state]||t.status;
-}
-function taskRow(t) { return `<div class="task" data-task="${esc(t.id)}"><div class="task-main"><div class="meta-row"><span class="source-chip">${esc(t.source)}</span><span class="arrow">→</span><span>${esc(t.project_name)}</span></div><div class="task-title">${esc(workflowForTask(t)?.name||t.title)}</div></div>${badge(taskStatus(t))}<div class="time">${timeText(t.updated_at)}</div></div>`; }
+function switchPage(page) { state.page=page; sessionStorage.setItem('bridgePage',page); for(const name of ['tasks','connections','feishu']) { $(name+'Page').classList.toggle('hidden',page!==name); $('nav'+name[0].toUpperCase()+name.slice(1)).classList.toggle('active',page===name); } $('pageTitle').textContent=({tasks:'任务',connections:'连接',feishu:'飞书',})[page]; $('pageSubtitle').textContent=({tasks:'外部系统交给 Codex 的任务。',connections:'管理谁可以给哪些 Codex 项目派任务。',feishu:'在这台 Mac 上直接接收飞书消息。'})[page]; $('primaryAction').classList.toggle('hidden',page!=='connections'); if(page==='feishu') renderFeishu();  }
+function taskStatus(t){return t.display_status||t.status;}
+function taskRow(t) { return `<div class="task" data-task="${esc(t.id)}"><div class="task-main"><div class="meta-row"><span class="source-chip">${esc(t.source)}</span><span class="arrow">→</span><span>${esc(t.project_name)}</span></div><div class="task-title">${esc(t.archive_name||t.title)}</div></div>${badge(taskStatus(t))}<div class="time">${timeText(t.updated_at)}</div></div>`; }
 function renderTasks() {
  const tasks=state.tasks; const attention=tasks.filter(t=>['需要你处理','流程受阻','等待审核'].includes(taskStatus(t))); const others=tasks.filter(t=>!attention.includes(t));
  const paired=(state.feishu?.allowed_open_ids||[]).length>0;
@@ -41,9 +37,9 @@ async function refresh(force=false) {
  if(refreshPromise){ if(!force)return refreshPromise; await refreshPromise; }
  const request=(async()=>{
   try {
-   const [projects,connections,tasks,feishu,workflowRuns]=await Promise.all([api('/api/projects'),api('/api/connections'),api('/api/tasks'),api('/api/feishu'),api('/api/feishu/workflow-runs')]);
-   state.projects=projects; state.connections=connections; state.tasks=tasks; state.feishu=feishu; state.workflowRuns=workflowRuns;
-   renderTasks(); renderConnections(); if(state.page==='feishu')renderFeishu(); if(window.renderConfigPages)window.renderConfigPages();
+   const [projects,connections,tasks,feishu]=await Promise.all([api('/api/projects'),api('/api/connections'),api('/api/tasks'),api('/api/feishu')]);
+   state.projects=projects; state.connections=connections; state.tasks=tasks; state.feishu=feishu;
+   renderTasks(); renderConnections(); if(state.page==='feishu')renderFeishu(); 
    $('serviceNotice').classList.add('hidden');
    if(state.drawer?.kind==='task')await showTask(state.drawer.id,false);
    return true;
@@ -113,6 +109,7 @@ function renderFeishu() {
  runtime.className='status '+(f.runtime==='已停用'||f.runtime==='配置错误'?'fail':'wait');
  renderQuickFeishu();
  $('advancedSave').textContent=state.pending.advanced?'保存中…':'保存飞书设置';
+ if(!state.promptDirty)$('feishuPrompt').value=f.prompt_template||'';
  if(state.feishuDirty){renderFeishuPromptPreview();return;}
  if($('feishuAppId').value!==(f.app_id||''))$('feishuAppId').value=f.app_id||'';
  $('feishuSecret').value='';
@@ -122,7 +119,7 @@ function renderFeishu() {
  $('feishuUsers').value=(f.allowed_open_ids||[]).join('\n');
  $('feishuChats').value=(f.allowed_chat_ids||[]).join('\n');
  $('feishuBotId').value=f.bot_open_id||'';
- $('feishuPrompt').value=f.prompt_template||'';
+ if(!state.promptDirty)$('feishuPrompt').value=f.prompt_template||'';
  $('feishuEnabled').checked=!!f.enabled;
  renderFeishuPromptPreview();
 }
@@ -175,14 +172,15 @@ function renderFeishuPromptPreview() {
  preview.textContent=error||result;
  preview.classList.toggle('preview-error',!!error);
  $('feishuPrompt').setAttribute('aria-invalid',error?'true':'false');
- $('advancedSave').disabled=!!error||state.pending.advanced;
+ $('advancedSave').disabled=state.pending.advanced;
+ $('savePrompt').disabled=!!error||!!state.pending.prompt;
  return !error;
 }
 const idLines = value => [...new Set(value.split(/\r?\n|,/).map(x=>x.trim()).filter(Boolean))];
 async function saveFeishu(e) {
  e.preventDefault();
- if(state.pending.advanced||!renderFeishuPromptPreview())return;
- const body={app_id:$('feishuAppId').value.trim(),connection_id:$('feishuConnection').value,allowed_open_ids:idLines($('feishuUsers').value),allowed_chat_ids:idLines($('feishuChats').value),bot_open_id:$('feishuBotId').value.trim(),prompt_template:$('feishuPrompt').value,enabled:$('feishuEnabled').checked};
+ if(state.pending.advanced)return;
+ const body={app_id:$('feishuAppId').value.trim(),connection_id:$('feishuConnection').value,allowed_open_ids:idLines($('feishuUsers').value),allowed_chat_ids:idLines($('feishuChats').value),bot_open_id:$('feishuBotId').value.trim(),enabled:$('feishuEnabled').checked};
  if($('feishuSecret').value)body.app_secret=$('feishuSecret').value;
  state.pending.advanced=true;feedback('advancedFeedback','正在保存飞书设置…');renderFeishu();
  try{
@@ -194,7 +192,20 @@ async function saveFeishu(e) {
 }
 function openOverlay(kind, heading, html) { if(state.drawer?.kind!==kind)feedback('drawerFeedback'); state.drawer={kind,id:state.drawer?.id}; $('drawerHeading').textContent=heading; setHtmlIfChanged('drawerBody',html); $('overlay').classList.add('show'); $('drawer').classList.add('show'); }
 function closeDrawer(){ $('drawer').classList.remove('show'); state.drawer=null; if(!$('modal').classList.contains('show')) $('overlay').classList.remove('show'); }
-async function showTask(id,focus=true) { if(focus)feedback('drawerFeedback'); try { const t=await api('/api/tasks/'+encodeURIComponent(id)); const workflowRun=workflowForTask(t); if(!focus && state.drawer?.id!==id) return; const messages=t.messages.map((m,i)=>`<div style="padding:10px 0;border-bottom:1px solid var(--line)"><div style="font-size:10px;color:var(--muted);margin-bottom:4px">${timeText(m.created_at)} · ${esc(t.source)}</div><div style="font-size:13px;line-height:1.55;white-space:pre-wrap">${esc(m.content)}</div></div>`).join(''); let action=''; if(t.status==='需要你处理' && t.thread_id) action=`<a class="btn primary" style="margin-top:12px;text-decoration:none" href="codex://threads/${encodeURIComponent(t.thread_id)}">去 Codex 处理</a>`; if(workflowRun) action+=`<button class="btn" style="margin-top:12px" data-workflow-run="${esc(workflowRun.id)}">查看流程进度</button>`; if(t.error_code==='project_unavailable') action=`<button class="btn primary" style="margin-top:12px" data-repath="${esc(t.connection_id)}">重新选择项目</button>`; if(t.status==='失败' && !action) action=`<button class="btn primary" style="margin-top:12px" data-settings="${esc(t.connection_id)}">检查连接设置</button>`; if(t.approval) action+=`<div class="cred"><div style="font-size:12px;line-height:1.6;white-space:pre-wrap;margin-bottom:12px">${esc(t.approval.detail)}</div><button class="btn primary" data-approval="${esc(t.approval.id)}" data-decision="accept" ${state.pending.approval?'disabled':''}>允许此操作</button> <button class="btn" data-approval="${esc(t.approval.id)}" data-decision="decline" ${state.pending.approval?'disabled':''}>拒绝</button></div>`; const html=`<div class="meta-row" style="margin-bottom:12px"><span class="source-chip">${esc(t.source)}</span><span class="arrow">→</span><span>${esc(t.project_name)}</span></div><h2 class="detail-title">${esc(workflowRun?.name||t.title)}</h2><div class="detail-grid"><div class="detail-item"><label>状态</label><strong>${esc(taskStatus(t))}</strong></div><div class="detail-item"><label>时间</label><strong>${timeText(t.created_at)}</strong></div></div>${workflowRun?.state==='blocked'?`<section class="detail-section" role="status"><h3>流程已暂停 · 需要处理</h3><div class="result-box" style="white-space:pre-wrap">${esc(workflowRun.error||t.result||'请查看当前阶段的处理要求。')}</div><p class="config-help">处理上述原因后，在原 Codex 任务中说明修改内容，再恢复流程。重复点击旧审核卡不会解除暂停。</p><div style="display:flex;gap:10px;flex-wrap:wrap">${action}</div></section>`:''}<div class="detail-section"><h3>任务内容</h3><div class="result-box" style="white-space:pre-wrap">${esc(t.title)}</div></div><div class="detail-section"><h3>任务要求记录</h3>${messages}</div><div class="detail-section"><h3>${workflowRun?.state==='completed'||(!workflowRun&&t.status==='已完成')?'最终结果':'Codex 本轮回复'}</h3><div class="result-box" style="white-space:pre-wrap">${esc(t.result||({'等待 Codex':'等待 Codex 接收任务。','执行中':'Codex 正在处理。','需要你处理':'Codex 正在等待你的操作。','已停止':'任务已停止。'}[t.status]||'任务未完成。'))}</div>${workflowRun?.state==='blocked'?'':action}</div>`; openOverlay('task','任务详情',html); state.drawer={kind:'task',id}; } catch(e){toast(e.message);} }
+async function showTask(id,focus=true) {
+ if(focus)feedback('drawerFeedback');
+ try {
+  const t=await api('/api/tasks/'+encodeURIComponent(id));
+  if(!focus && state.drawer?.id!==id)return;
+  const messages=t.messages.map(m=>`<div class="result-box" style="white-space:pre-wrap;margin:10px 0"><small>${timeText(m.created_at)}</small><p>${esc(m.content)}</p></div>`).join('');
+  let action='';
+  if(!t.archived && t.status==='需要你处理' && t.thread_id)action=`<a class="btn primary" href="codex://threads/${encodeURIComponent(t.thread_id)}">去 Codex 处理</a>`;
+  if(!t.archived && t.error_code==='project_unavailable')action=`<button class="btn primary" data-repath="${esc(t.connection_id)}">重新选择项目</button>`;
+  if(!t.archived && t.approval)action+=`<div class="cred"><p>${esc(t.approval.detail)}</p><button class="btn primary" data-approval="${esc(t.approval.id)}" data-decision="accept" ${state.pending.approval?'disabled':''}>允许此操作</button> <button class="btn" data-approval="${esc(t.approval.id)}" data-decision="decline" ${state.pending.approval?'disabled':''}>拒绝</button></div>`;
+  const html=`<h2 class="detail-title">${esc(t.archive_name||t.title)}</h2><div class="detail-grid"><div class="detail-item"><label>状态</label><strong>${esc(taskStatus(t))}</strong></div><div class="detail-item"><label>时间</label><strong>${timeText(t.created_at)}</strong></div></div>${t.archived?'<p class="config-help">这是改版前的历史记录，仅供查看。新任务请从飞书发送一条新消息，将按当前 Prompt 执行。</p>':''}<section class="detail-section"><h3>任务回复</h3><div class="result-box" style="white-space:pre-wrap">${esc(t.result||'尚无回复。')}</div><div style="margin-top:12px">${action}</div></section><details class="detail-section"><summary>任务消息记录</summary>${messages}</details>`;
+  openOverlay('task','任务详情',html);state.drawer={kind:'task',id};
+ }catch(e){toast(e.message);}
+}
 function connectionText(c) { return `请通过这个连接给我的 Codex 发送任务：\n连接：${c.source} → ${c.project_name}\n接口：${c.endpoint}\n密钥：${c.api_key}\n\n新任务：POST 接口，Authorization: Bearer <密钥>，Content-Type: application/json，JSON: {"message":"任务内容","request_id":"唯一请求编号"}。\n继续同一个任务：在 JSON 中加上返回的 task_id；每条新消息使用新的 request_id。\n查询状态：GET ${c.endpoint}/<task_id>，使用同一密钥。`; }
 function legacyCopy(text) {
  const field=document.createElement('textarea');
@@ -275,3 +286,12 @@ $('retryRefresh').onclick=async()=>{const button=$('retryRefresh');if(button.dis
 switchPage(state.page);refresh();setInterval(refresh,3000);
 $('startupNotice').hidden=true;
 $('panelRoot').hidden=false;
+
+$('promptForm').addEventListener('input',e=>{if(e.target.id!=='feishuSample')state.promptDirty=true;feedback('promptFeedback');renderFeishuPromptPreview();});
+$('promptForm').addEventListener('submit',async e=>{
+ e.preventDefault();if(state.pending.prompt||!renderFeishuPromptPreview())return;
+ state.pending.prompt=true;$('savePrompt').disabled=true;$('savePrompt').textContent='保存中…';
+ try{await api('/api/feishu',{method:'PATCH',body:JSON.stringify({prompt_template:$('feishuPrompt').value})});state.promptDirty=false;await refresh(true);feedback('promptFeedback','已保存。之后收到的新消息使用这个 Prompt。','success');}
+ catch(err){feedback('promptFeedback',err.message,'error');}
+ finally{state.pending.prompt=false;$('savePrompt').disabled=false;$('savePrompt').textContent='保存 Prompt';}
+});

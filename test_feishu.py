@@ -107,14 +107,19 @@ class FeishuBridgeTests(unittest.TestCase):
     def test_reply_to_prior_message_reuses_task(self):
         self.adapter.handle_event(event())
         self.adapter.pump_once()
-        self.adapter.handle_event(event("om_followup", text="补充要求", parent="om_first"))
+        original = self.inbox.linked_source('om_first')['task_id']
+        self.adapter.handle_event(event('om_followup', text='补充要求', parent='om_first'))
         self.adapter.pump_once()
-        links = self.inbox.submitted()
-        self.assertEqual(len(links), 2)
-        self.assertEqual(links[0]["task_id"], links[1]["task_id"])
+        self.assertEqual(len(self.bridge.submissions), 1)
+        self.bridge.tasks[original] = {'status':'已完成','result':'Original turn result'}
+        self.adapter.pump_once()
+        followup = self.inbox.linked_source('om_followup')
+        self.assertEqual(followup['task_id'], original)
         self.assertEqual(len(self.bridge.tasks), 1)
-        self.assertIn("补充要求", self.bridge.submissions[1][0])
-        self.assertEqual(self.bridge.submissions[1][1], links[0]["task_id"])
+        self.assertIn('补充要求', self.bridge.submissions[1][0])
+        self.assertEqual(self.bridge.submissions[1][1], original)
+        self.assertEqual(len(self.sender.sent), 1)
+        self.assertIn('Original turn result', self.sender.sent[0][2])
 
     def test_custom_prompt_is_frozen_when_message_arrives(self):
         self.config["prompt_template"] = "项目规则：先核对事实。\n请求：{{message}}"

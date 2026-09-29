@@ -10,13 +10,10 @@ import threading
 from pathlib import Path
 
 from codex_http_bridge import BridgeError
-from card_config import default_cards, validate_cards
-from workflow_contract import validate_workflow
 
 FIELDS = {
     "app_id", "app_secret", "connection_id", "allowed_open_ids",
     "allowed_chat_ids", "bot_open_id", "enabled", "prompt_template",
-    "cards", "routes", "default_card_types", "review_prompt_template",
 }
 MESSAGE_VARIABLE = "{{message}}"
 CONFIG_LOCK = threading.RLock()
@@ -67,14 +64,11 @@ def public(value):
         "enabled": value.get("enabled", False),
         "has_secret": bool(value.get("app_secret")),
         "prompt_template": value.get("prompt_template", DEFAULT_PROMPT_TEMPLATE),
-        "review_prompt_template": value.get("review_prompt_template", ""),
         "pairing_code": value.get("pairing_code", ""),
         "pairing_expires_at": value.get("pairing_expires_at", 0),
         "bot_name": value.get("bot_name", ""),
         "bot_ready": value.get("bot_ready", False),
-        "cards": value.get("cards", default_cards()),
-        "default_card_types": value.get("default_card_types", ["voice_review"]),
-        "routes": [{k:v for k,v in r.items() if k != "connection_key"} for r in value.get("routes", [])],
+
     }
 
 
@@ -88,8 +82,6 @@ def _save(path, payload, store, *, internal=None, validate_only=False):
         raise BridgeError(400, "invalid_feishu_settings", "飞书设置包含无效字段")
     current = load(path)
     value = {**current, **payload, **(internal or {})}
-    if current.get('app_id') and payload.get('app_id',current['app_id']) != current['app_id']:
-        value['routes'] = []
     if current.get("app_id") and "app_id" in payload and payload["app_id"] != current["app_id"] and not internal:
         value.update({
             "allowed_open_ids": [], "allowed_chat_ids": [], "bot_open_id": "",
@@ -98,10 +90,6 @@ def _save(path, payload, store, *, internal=None, validate_only=False):
         })
     value["prompt_template"] = validate_prompt_template(
         value.get("prompt_template", DEFAULT_PROMPT_TEMPLATE))
-    if value.get('review_prompt_template'):
-        validate_prompt_template(value['review_prompt_template'])
-    elif 'review_prompt_template' in value and value['review_prompt_template'] != '':
-        raise BridgeError(400, 'invalid_prompt_template', '第二阶段 Prompt 必须为文本')
     if not payload.get("app_secret"):
         value["app_secret"] = current.get("app_secret", "")
     if not isinstance(value.get("enabled", False), bool):
@@ -136,42 +124,6 @@ def _save(path, payload, store, *, internal=None, validate_only=False):
         raise BridgeError(400, "incomplete_feishu_settings", "启用前请填写应用凭据和连接")
     if value["enabled"] and value["allowed_chat_ids"] and not bot_id:
         raise BridgeError(400, "incomplete_feishu_settings", "启用群聊前请填写机器人 Open ID")
-    value['cards'] = validate_cards(value.get('cards', default_cards()))
-    card_ids = {c['id'] for c in value['cards']}
-    defaults = value.get('default_card_types', ['voice_review'])
-    if not isinstance(defaults,list) or any(not isinstance(c,str) or c not in card_ids for c in defaults):
-        raise BridgeError(400,'invalid_routes','默认启用的卡片不存在')
-    value['default_card_types'] = list(dict.fromkeys(defaults))
-    routes = value.get('routes', [])
-    if not isinstance(routes,list) or len(routes)>100:
-        raise BridgeError(400,'invalid_routes','最多配置 100 个群流程')
-    seen=set()
-    for route in routes:
-        if not isinstance(route,dict) or set(route)-{'chat_id','name','connection_id','prompt_template','review_prompt_template','card_types','enabled','connection_key','workflow'}:
-            raise BridgeError(400,'invalid_routes','群流程字段无效')
-        chat=route.get('chat_id')
-        if not isinstance(chat,str) or chat not in value['allowed_chat_ids'] or chat in seen:
-            raise BridgeError(400,'invalid_routes','请从已配对的群中选择，且每个群只配置一次')
-        seen.add(chat)
-        if not isinstance(route.get('name'),str) or not 1<=len(route['name'])<=80:
-            raise BridgeError(400,'invalid_routes','请填写群流程名称')
-        validate_prompt_template(route.get('prompt_template'))
-        if route.get('review_prompt_template'):
-            validate_prompt_template(route['review_prompt_template'])
-        elif 'review_prompt_template' in route and route['review_prompt_template'] != '':
-            raise BridgeError(400,'invalid_prompt_template','第二阶段 Prompt 必须为文本')
-        if not isinstance(route.get('enabled',True),bool):
-            raise BridgeError(400,'invalid_routes','群流程启用状态无效')
-        cards=route.get('card_types',[])
-        if not isinstance(cards,list) or any(not isinstance(c,str) or c not in card_ids for c in cards):
-            raise BridgeError(400,'invalid_routes','群流程引用的卡片不存在')
-        connection=store.connection(route.get('connection_id'),reveal=True)
-        if route.get('enabled',True) and connection['status']=='已停用':
-            raise BridgeError(400,'connection_disabled','群流程引用的连接已停用')
-        route['connection_key']=connection['api_key']
-        if route.get('workflow'):
-            route['workflow']=validate_workflow(route['workflow'],value['cards'],value['allowed_open_ids'])
-    value['routes']=routes
     if validate_only:
         return public(value)
     path = Path(path)

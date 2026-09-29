@@ -154,9 +154,8 @@ class FeishuScenarioTests(unittest.TestCase):
         task = self.store.tasks()[0]
         self.assertEqual(task["status"], "等待 Codex")
         content=self.store.task(task["id"])["messages"][0]["content"]
-        self.assertTrue(content.startswith("固定规则：检查项目\n"))
-        self.assertIn('来源消息 ID：om_task',content)
-        self.assertIn('bridge_send_card',content)
+        self.assertEqual(content,"固定规则：检查项目")
+        self.assertNotIn("bridge_send_card",content)
 
     def test_08_unknown_private_sender_is_ignored(self):
         self.setup_app()
@@ -197,6 +196,7 @@ class FeishuScenarioTests(unittest.TestCase):
         self.assertFalse(adapter.handle_event(first))
         adapter.pump_once()
         original = self.store.tasks()[0]["id"]
+        self.store.set_task(original, "已完成", "已检查")
         self.assertTrue(adapter.handle_event(event("om_followup", "补充检查日志", parent="om_first")))
         adapter.pump_once()
         self.assertEqual(len(self.store.tasks()), 1)

@@ -27,10 +27,8 @@ from feishu_settings import load as load_feishu_settings, public as public_feish
 from feishu_settings import complete_pairing, save as save_feishu_settings, start_pairing
 from feishu_probe import probe as probe_feishu
 from feishu_supervisor import FeishuSupervisor
-from feishu_worker import Inbox, FeishuSender
-from workflow_admin import context as workflow_context, configure as configure_workflow
-import card_assistant
-from workflow_dispatch import WorkflowDispatch
+from feishu_worker import Inbox
+from legacy_history import LegacyHistory
 
 LOG = logging.getLogger("codex_bridge")
 ROOT = Path(__file__).resolve().parent
@@ -131,6 +129,7 @@ class Store:
         self.projects_path = Path(projects_path)
         self.codex_state_path = Path(codex_state_path) if codex_state_path else None
         self._project_discovery_warning_at = 0.0
+        self.history = LegacyHistory(Path(db_path).parent / "feishu-inbox.sqlite3")
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init()
 
@@ -210,7 +209,7 @@ class Store:
             return []
 
     def projects(self):
-        configured = json.loads(self.projects_path.read_text(encoding="utf-8"))
+        configured = json.loads(self.projects_path.read_text(encoding="utf-8")) if self.projects_path.exists() else {}
         result = []
         paths = set()
         for project_id, path in configured.items():
@@ -231,7 +230,7 @@ class Store:
         return result
 
     def project(self, project_id):
-        configured = json.loads(self.projects_path.read_text(encoding="utf-8"))
+        configured = json.loads(self.projects_path.read_text(encoding="utf-8")) if self.projects_path.exists() else {}
         if project_id in configured:
             path = configured[project_id]
             item = {"id": project_id, "name": Path(path).name, "path": path}
@@ -327,6 +326,8 @@ class Store:
         requested_task = payload.get("task_id")
         if requested_task is not None and (not isinstance(requested_task, str) or len(requested_task) > 100):
             raise BridgeError(400, "invalid_task_id", "task_id 无效")
+        if requested_task and requested_task in self.history.tasks():
+            raise BridgeError(409, "historical_task", "旧版任务仅供查看，请从飞书发送新消息创建任务")
         fingerprint = digest(json.dumps([requested_task, message], ensure_ascii=False))
         cid = connection["id"]
         with self.db() as db:
@@ -357,7 +358,8 @@ class Store:
             rows = db.execute("""SELECT t.*, c.source,c.project_id FROM tasks t JOIN connections c ON c.id=t.connection_id ORDER BY t.updated_at DESC""").fetchall()
             first = {r["task_id"]:r["content"] for r in db.execute("SELECT task_id,content FROM messages ORDER BY created_at DESC")}
         names = {p["id"]:p["name"] for p in self.projects()}
-        return [{**dict(r), "title": first.get(r["id"], ""), "project_name": names.get(r["project_id"], r["project_id"])} for r in rows]
+        archived = self.history.tasks()
+        return [{**dict(r), **archived.get(r["id"], {}), "title": first.get(r["id"], ""), "project_name": names.get(r["project_id"], r["project_id"])} for r in rows]
 
     def task(self, task_id, connection_id=None):
         with self.db() as db:
@@ -369,7 +371,7 @@ class Store:
             approval = db.execute("SELECT id,method,detail,state FROM approvals WHERE task_id=? ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
         if not row:
             raise BridgeError(404, "task_not_found", "任务不存在")
-        obj = dict(row)
+        obj = {**dict(row), **self.history.tasks().get(task_id, {})}
         obj["messages"] = messages
         obj["approval"] = dict(approval) if approval and approval["state"] == "pending" else None
         obj["title"] = messages[0]["content"] if messages else ""
@@ -412,7 +414,7 @@ class Store:
 
 
 class Engine:
-    def __init__(self, store, transport=None, interval=2, max_active=MAX_ACTIVE_TASKS, workflow_inbox_path=None):
+    def __init__(self, store, transport=None, interval=2, max_active=MAX_ACTIVE_TASKS, history_inbox_path=None):
         if max_active < 1:
             raise ValueError("max_active must be positive")
         self.store = store
@@ -424,9 +426,8 @@ class Engine:
         self.approval_lock = threading.Lock()
         self.pending_approvals = {}
         self.worker = None
-        self.workflow_dispatch = WorkflowDispatch(workflow_inbox_path) if workflow_inbox_path else None
-        self.live_workflow = False
-        self.held_workflow_messages = {}
+        self.history = LegacyHistory(history_inbox_path) if history_inbox_path else store.history
+        self.archived_tasks = {}
         if hasattr(self.transport, "client"):
             self.transport.client.on_server_request = self._on_server_request
 
@@ -479,40 +480,12 @@ class Engine:
         if not self.lock.acquire(False):
             return
         try:
-            self._reconcile_workflow_queue()
+            self.archived_tasks = self.history.tasks()
             self._refresh()
             if self._codex_desktop_open():
                 self._deliver_one()
         finally:
             self.lock.release()
-
-    def _reconcile_workflow_queue(self):
-        if not self.workflow_dispatch:
-            return
-        stale, self.live_workflow, self.held_workflow_messages, states = self.workflow_dispatch.snapshot()
-        with self.store.db() as db:
-            for (connection_id, task_id, request_id), run_id in stale.items():
-                changed = db.execute("""UPDATE messages SET delivery='superseded',updated_at=?
-                    WHERE connection_id=? AND task_id=? AND request_id=? AND delivery='queued'""",
-                    (now(), connection_id, task_id, request_id)).rowcount
-                if changed:
-                    LOG.info('superseded obsolete stage run=%s task=%s request=%s', run_id, task_id, request_id)
-            for (connection_id, task_id), (state, reason) in states.items():
-                if state == 'blocked':
-                    reason = reason or '流程已暂停，请查看当前阶段的处理要求。'
-                    db.execute("""UPDATE tasks SET status='需要你处理',result=?,error_code='workflow_blocked',updated_at=?
-                        WHERE id=? AND connection_id=? AND
-                        (status!='需要你处理' OR error_code IS NOT 'workflow_blocked' OR result IS NOT ?)""",
-                        (reason, now(), task_id, connection_id, reason))
-                else:
-                    # A retry creates a new epoch. Release only the workflow's
-                    # own pause so the worker can submit it to the same task.
-                    db.execute("""UPDATE tasks SET status=CASE WHEN ?='cancelled' THEN '已停止'
-                        WHEN EXISTS (SELECT 1 FROM messages WHERE task_id=tasks.id AND delivery IN ('queued','sending','uncertain'))
-                        THEN '等待 Codex' ELSE '已完成' END,
-                        result=NULL,error_code=NULL,updated_at=?
-                        WHERE id=? AND connection_id=? AND error_code='workflow_blocked'""",
-                        (state, now(), task_id, connection_id))
 
     @staticmethod
     def _codex_desktop_open():
@@ -535,6 +508,8 @@ class Engine:
                  (status='等待 Codex' AND EXISTS (SELECT 1 FROM messages WHERE task_id=tasks.id AND delivery='superseded')
                   AND NOT EXISTS (SELECT 1 FROM messages WHERE task_id=tasks.id AND delivery IN ('queued','sending','uncertain'))))""").fetchall()
         for row in rows:
+            if row["id"] in self.archived_tasks:
+                continue
             try:
                 thread = self.transport.read(row["thread_id"])
             except Exception:
@@ -566,15 +541,15 @@ class Engine:
             elif state in ("inProgress", "in_progress") and row["status"] != "需要你处理":
                 self.store.set_task(row["id"], "执行中")
         with self.store.db() as db:
-            active = db.execute("SELECT 1 FROM tasks WHERE status IN ('执行中','需要你处理') AND error_code IS NOT 'workflow_blocked' LIMIT 1").fetchone()
-        if not active and not self.live_workflow:
+            active = any(r[0] not in self.archived_tasks for r in db.execute("SELECT id FROM tasks WHERE status IN ('执行中','需要你处理')"))
+        if not active:
             release = getattr(self.transport, "release_idle", None)
             if release:
                 release()
 
     def _deliver_one(self):
         with self.store.db() as db:
-            active = db.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('执行中','需要你处理') AND error_code IS NOT 'workflow_blocked'").fetchone()[0]
+            active = sum(r[0] not in self.archived_tasks for r in db.execute("SELECT id FROM tasks WHERE status IN ('执行中','需要你处理')"))
             if active >= self.max_active:
                 return
             rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,c.project_id
@@ -583,7 +558,7 @@ class Engine:
                 AND NOT EXISTS (SELECT 1 FROM messages older WHERE older.task_id=m.task_id AND older.created_at<m.created_at AND older.delivery IN ('queued','sending','uncertain'))
                 ORDER BY m.created_at""").fetchall()
         for row in rows:
-            if (row['connection_id'], row['task_id'], row['request_id']) in self.held_workflow_messages:
+            if row['task_id'] in self.archived_tasks:
                 continue
             if self._deliver_message(dict(row)):
                 return
@@ -739,7 +714,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403, "origin_forbidden", "来源无效")
                 if self.command == "GET" and path in ("/", "/panel"):
                     return self.serve_file(static / "index.html", "text/html; charset=utf-8")
-                if self.command == "GET" and path in ("/static/style.css", "/static/app.js", "/static/flows.js", "/static/cards.js"):
+                if self.command == "GET" and path in ("/static/style.css", "/static/app.js"):
                     mime = "text/css; charset=utf-8" if path.endswith("css") else "application/javascript; charset=utf-8"
                     return self.serve_file(static / path.split("/")[-1], mime)
                 if path == "/healthz" and self.command == "GET":
@@ -749,65 +724,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403, "local_only", "飞书设置只能在本机修改")
                     if feishu_settings_path is None:
                         raise BridgeError(503, "feishu_unavailable", "飞书设置未启用")
-                    if path == '/api/feishu/workflow-context' and self.command == 'GET':
-                        return self.send_json(200,workflow_context(feishu_settings_path,store))
-                    elif path == '/api/feishu/card-assistant' and self.command == 'GET':
-                        return self.send_json(200,card_assistant.list_requests(store))
-                    elif path == '/api/feishu/card-assistant' and self.command == 'POST':
-                        return self.send_json(202,card_assistant.submit(feishu_settings_path,store,self.read_json()))
-                    elif path == '/api/feishu/configure-workflow' and self.command == 'POST':
-                        return self.send_json(200,configure_workflow(feishu_settings_path,store,self.read_json(65536)))
-                    elif path == '/api/feishu/workflow-runs' and self.command == 'GET':
-                        return self.send_json(200,Inbox(feishu_inbox_path).workflows.list())
-                    elif path.startswith('/api/feishu/workflow-runs/') and self.command == 'GET':
-                        return self.send_json(200,Inbox(feishu_inbox_path).workflows.get(path.rsplit('/',1)[-1]))
-                    elif path == '/api/feishu/workflow-run' and self.command == 'POST':
-                        args=self.read_json(65536)
-                        if not isinstance(args,dict):raise BridgeError(400,'invalid_run_action','参数需要对象')
-                        runtime=Inbox(feishu_inbox_path).workflows
-                        run=runtime.get(args.get('run_id'))
-                        cfg=load_feishu_settings(feishu_settings_path)
-                        source=runtime.inbox.cards.source(run['source_id'])
-                        if args.get('action')!='cancel' and (run['app_id']!=cfg['app_id'] or run['sender_id'] not in cfg.get('allowed_open_ids',[]) or (source.get('chat_type')=='group' and run['chat_id'] not in cfg.get('allowed_chat_ids',[]))):
-                            raise BridgeError(403,'workflow_authorization_changed','原任务的应用、用户或群授权已变化')
-                        def receipt_reader(value):
-                            return FeishuSender(cfg['app_id'],cfg['app_secret']).verify_receipt(value,run['chat_id'])
-                        return self.send_json(200,runtime.act(args,receipt_reader=receipt_reader))
-                    elif path == '/api/feishu/cards/send' and self.command == 'POST':
-                        data=self.read_json()
-                        if not isinstance(data,dict) or set(data)!={'source_message_id','card_type','variables','request_id'}:
-                            raise BridgeError(400,'invalid_request','需要来源消息、卡片标识、变量和 request_id')
-                        if not all(isinstance(data[k],str) for k in ('source_message_id','card_type','request_id')):
-                            raise BridgeError(400,'invalid_request','卡片标识与来源消息必须为文本')
-                        config=load_feishu_settings(feishu_settings_path)
-                        if not config.get('enabled'): raise BridgeError(409,'feishu_disabled','飞书接收器未启用')
-                        inbox=Inbox(feishu_inbox_path)
-                        source=inbox.cards.source(data['source_message_id'])
-                        store.task(source['task_id'],source.get('connection_id') or config.get('connection_id'))
-                        if source['sender_id'] not in config.get('allowed_open_ids',[]):
-                            raise BridgeError(403,'sender_removed','原任务发起人已不在允许名单')
-                        result=inbox.cards.enqueue(config,source,data['card_type'],data['variables'],data['request_id'])
-                        return self.send_json(202,result)
-                    elif path == '/api/feishu/card-deliveries' and self.command == 'GET':
-                        return self.send_json(200,Inbox(feishu_inbox_path).cards.list())
-                    elif path in ('/api/feishu/cards','/api/feishu/routes') and self.command == 'POST':
-                        field='cards' if path.endswith('/cards') else 'routes'
-                        key='id' if field=='cards' else 'chat_id'
-                        data=self.read_json()
-                        if not isinstance(data,dict) or not isinstance(data.get(key),str):
-                            raise BridgeError(400,'invalid_request','缺少配置标识')
-                        current=public_feishu_settings(load_feishu_settings(feishu_settings_path))
-                        entries=[r for r in current[field] if r[key]!=data[key]]+[data]
-                        save_feishu_settings(feishu_settings_path,{field:entries},store)
-                    elif path in ('/api/feishu/cards/remove','/api/feishu/routes/remove') and self.command == 'POST':
-                        field='cards' if '/cards/' in path else 'routes'
-                        key='id' if field=='cards' else 'chat_id'
-                        data=self.read_json()
-                        if not isinstance(data,dict) or set(data)!={key}:
-                            raise BridgeError(400,'invalid_request','无效的移除请求')
-                        current=public_feishu_settings(load_feishu_settings(feishu_settings_path))
-                        save_feishu_settings(feishu_settings_path,{field:[r for r in current[field] if r[key]!=data[key]]},store)
-                    elif path == "/api/feishu" and self.command == "PATCH":
+                    if path == "/api/feishu" and self.command == "PATCH":
                         save_feishu_settings(feishu_settings_path, self.read_json(), store)
                     elif path == "/api/feishu/setup" and self.command == "POST":
                         data = self.read_json()
@@ -893,6 +810,8 @@ def make_handler(store, engine, base_url, allowed_host=None,
                 if path.startswith("/api/tasks/") and self.command == "GET":
                     return self.send_json(200, store.task(path.rsplit("/", 1)[-1]))
                 if path.startswith("/api/tasks/") and self.command == "PATCH":
+                    if path.rsplit("/", 1)[-1] in store.history.tasks():
+                        raise BridgeError(409, "historical_task", "历史任务仅供查看")
                     data = self.read_json()
                     if set(data) - {"status", "result"}:
                         raise BridgeError(400, "invalid_request", "无效字段")
@@ -935,7 +854,7 @@ def main():
     raise_nofile_limit()
     store = Store(args.db, args.projects)
     engine = Engine(store, LocalCodexTransport(AppServerClient(os.getenv("CODEX_BIN", "codex"))),
-                    workflow_inbox_path=Path(args.db).parent / 'feishu-inbox.sqlite3')
+                    history_inbox_path=Path(args.db).parent / 'feishu-inbox.sqlite3')
     engine.start()
     base_url = f"http://127.0.0.1:{args.port}"
     feishu_settings_path = Path(os.getenv("FEISHU_CONFIG", str(Path(args.db).parent / "feishu.json")))

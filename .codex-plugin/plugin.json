@@ -1,15 +1,15 @@
 {
   "name": "codex-bridge-v2",
-  "version": "2.3.0",
-  "description": "Configure Feishu review workflows through Codex conversation",
+  "version": "2.4.0",
+  "description": "Local Feishu-to-Codex tasks controlled by editable prompts",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "Codex Bridge 2.3",
+    "displayName": "Codex Bridge 2.4",
     "shortDescription": "外部任务连接器",
-    "longDescription": "通过对话维护飞书多阶段流程，记录审核版本、产物和回执，并在原 Codex 任务继续。",
+    "longDescription": "接收飞书消息，填入可编辑 Prompt，在 Codex 任务中执行并回复结果。",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": [
