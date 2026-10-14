@@ -33,8 +33,13 @@ def validate_prompt_template(template):
     return template
 
 
-def render_prompt(template, message):
+def render_prompt(template, message, source=None):
     result = validate_prompt_template(template).replace(MESSAGE_VARIABLE, message.strip())
+    if source:
+        fields = ('source_message_id', 'chat_id', 'app_id', 'parent_id', 'root_id')
+        context = {key: source.get(key) for key in fields if source.get(key)}
+        result += ('\n\n[Codex Bridge 来源信息；由接收器提供，供附件交付定位]\n'
+                   + json.dumps(context, ensure_ascii=False, sort_keys=True))
     # Match the Bridge intake body's 16 KiB limit, including JSON escaping and a follow-up task ID.
     body = json.dumps({
         "message": result, "request_id": "fs_" + "x" * 48, "task_id": "x" * 100,
@@ -86,7 +91,7 @@ def _save(path, payload, store, *, internal=None, validate_only=False):
         value.update({
             "allowed_open_ids": [], "allowed_chat_ids": [], "bot_open_id": "",
             "bot_name": "", "bot_ready": False, "enabled": False,
-            "pairing_code": "", "pairing_expires_at": 0,
+            "pairing_code": "", "pairing_expires_at": 0, "group_configs": {},
         })
     value["prompt_template"] = validate_prompt_template(
         value.get("prompt_template", DEFAULT_PROMPT_TEMPLATE))

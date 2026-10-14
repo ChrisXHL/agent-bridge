@@ -89,3 +89,55 @@ class FeishuSupervisor:
             self.thread.join(timeout=7)
         else:
             self._halt()
+
+
+class MultiFeishuSupervisor:
+    """Exactly one receiver per application, with separate inboxes for new apps."""
+    def __init__(self, config_path, state_path, bridge_url):
+        self.config_path, self.state_path = Path(config_path), Path(state_path)
+        self.bridge_url = bridge_url
+        self.receivers = {}
+        self.stop = threading.Event()
+        self.thread = None
+        self.lock = threading.RLock()
+
+    def reconcile(self):
+        from feishu_groups import application_paths
+        seen = set()
+        with self.lock:
+            desired = {}
+            for ref, path, inbox in application_paths(self.config_path, self.state_path):
+                try: app_id = load(path).get('app_id')
+                except (OSError, ValueError):
+                    LOG.error('Invalid Feishu application configuration: %s', ref)
+                    continue
+                if not app_id or app_id in seen: continue
+                seen.add(app_id)
+                desired[ref] = (path, inbox)
+            for ref in set(self.receivers) - set(desired):
+                self.receivers.pop(ref).close()
+            for ref, (path, inbox) in desired.items():
+                if ref not in self.receivers:
+                    child = FeishuSupervisor(path, inbox, self.bridge_url)
+                    child.start(); self.receivers[ref] = child
+
+    def status_for(self, ref):
+        with self.lock:
+            child = self.receivers.get(ref)
+            return child.status() if child else '等待启动'
+
+    def status(self): return self.status_for('default')
+
+    def start(self):
+        self.reconcile()
+        def loop():
+            while not self.stop.wait(2):
+                try: self.reconcile()
+                except Exception: LOG.exception('Feishu application discovery failed')
+        self.thread=threading.Thread(target=loop,daemon=True);self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        if self.thread:self.thread.join(timeout=3)
+        with self.lock:
+            for child in self.receivers.values():child.close()

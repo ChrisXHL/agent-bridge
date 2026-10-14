@@ -16,3 +16,10 @@ backups/
 artifacts/
 .supervision*/
 .DS_Store
+# Additional application credentials and local authentication files
+feishu-apps/
+.envrc
+*.pem
+*.key
+auth.json
+credentials.json

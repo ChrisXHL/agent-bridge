@@ -20,12 +20,9 @@ for path in (agent_dir,data_dir,log_dir):
 os.umask(0o077)
 label='dev.codex.bridge.v2'
 plist=agent_dir/(label+'.plist')
-codex_cli=shutil.which('codex') or 'codex'
-# The npm launcher runs through Node, whose macOS privacy decision may differ
-# from the native Codex executable. Use the native binary when it is present.
-codex_package=pathlib.Path(codex_cli).resolve().parent.parent
-native_codex=codex_package/'node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex'
-codex_bin=str(native_codex) if native_codex.is_file() and os.access(native_codex,os.X_OK) else codex_cli
+sys.path.insert(0,str(root))
+from codex_runtime import resolve_codex_binary
+codex_bin=resolve_codex_binary(os.getenv('CODEX_BIN'))
 runtime=root/'.venv/bin/python'
 if not runtime.is_file():
     raise SystemExit('Create the 2.0 .venv and install requirements first')

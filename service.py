@@ -26,7 +26,8 @@ from codex_http_bridge import AppServerClient, BridgeError, RpcError, Bridge
 from feishu_settings import load as load_feishu_settings, public as public_feishu_settings
 from feishu_settings import complete_pairing, save as save_feishu_settings, start_pairing
 from feishu_probe import probe as probe_feishu
-from feishu_supervisor import FeishuSupervisor
+from feishu_supervisor import FeishuSupervisor, MultiFeishuSupervisor
+from feishu_groups import GroupSettings
 from feishu_worker import Inbox
 from legacy_history import LegacyHistory
 
@@ -659,6 +660,7 @@ class Engine:
 def make_handler(store, engine, base_url, allowed_host=None,
                  feishu_settings_path=None, feishu_supervisor=None, feishu_inbox_path=None):
     static = ROOT / "static"
+    group_settings = GroupSettings(feishu_settings_path, feishu_inbox_path, store, feishu_supervisor) if feishu_settings_path and feishu_inbox_path else None
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             LOG.info("http %s", args[1] if len(args) > 1 else "?")
@@ -714,7 +716,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403, "origin_forbidden", "来源无效")
                 if self.command == "GET" and path in ("/", "/panel"):
                     return self.serve_file(static / "index.html", "text/html; charset=utf-8")
-                if self.command == "GET" and path in ("/static/style.css", "/static/app.js"):
+                if self.command == "GET" and path in ("/static/style.css", "/static/app.js", "/static/feishu-groups.js"):
                     mime = "text/css; charset=utf-8" if path.endswith("css") else "application/javascript; charset=utf-8"
                     return self.serve_file(static / path.split("/")[-1], mime)
                 if path == "/healthz" and self.command == "GET":
@@ -724,6 +726,10 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403, "local_only", "飞书设置只能在本机修改")
                     if feishu_settings_path is None:
                         raise BridgeError(503, "feishu_unavailable", "飞书设置未启用")
+                    if path in ('/api/feishu/catalog','/api/feishu/apps','/api/feishu/groups','/api/feishu/app-pairing'):
+                        if not group_settings: raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
+                        data = self.read_json(limit=128*1024) if self.command == 'POST' else None
+                        return self.send_json(200, group_settings.dispatch(path,self.command,data))
                     if path == "/api/feishu" and self.command == "PATCH":
                         save_feishu_settings(feishu_settings_path, self.read_json(), store)
                     elif path == "/api/feishu/setup" and self.command == "POST":
@@ -858,7 +864,7 @@ def main():
     engine.start()
     base_url = f"http://127.0.0.1:{args.port}"
     feishu_settings_path = Path(os.getenv("FEISHU_CONFIG", str(Path(args.db).parent / "feishu.json")))
-    supervisor = FeishuSupervisor(
+    supervisor = MultiFeishuSupervisor(
         feishu_settings_path, Path(args.db).parent / "feishu-inbox.sqlite3", base_url)
     supervisor.start()
     server = ThreadingHTTPServer(

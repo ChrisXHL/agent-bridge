@@ -22,7 +22,7 @@ function taskStatus(t){return t.display_status||t.status;}
 function taskRow(t) { return `<div class="task" data-task="${esc(t.id)}"><div class="task-main"><div class="meta-row"><span class="source-chip">${esc(t.source)}</span><span class="arrow">→</span><span>${esc(t.project_name)}</span></div><div class="task-title">${esc(t.archive_name||t.title)}</div></div>${badge(taskStatus(t))}<div class="time">${timeText(t.updated_at)}</div></div>`; }
 function renderTasks() {
  const tasks=state.tasks; const attention=tasks.filter(t=>['需要你处理','流程受阻','等待审核'].includes(taskStatus(t))); const others=tasks.filter(t=>!attention.includes(t));
- const paired=(state.feishu?.allowed_open_ids||[]).length>0;
+ const paired=(state.feishu?.allowed_open_ids||[]).length>0||(state.feishu?.allowed_chat_ids||[]).length>0;
  $('firstUseTitle').textContent=paired?'等待第一条飞书任务':state.feishu?.has_secret?'完成飞书配对':'还没有外部任务';
  $('firstUseDescription').textContent=paired?'向已配对的飞书机器人发送一条普通消息，任务会显示在这里。':state.feishu?.has_secret?'应用已连接；完成机器人设置和身份配对后即可发送任务。':state.connections.length?'连接已创建；从任务来源发送一条消息，验证它能否进入 Codex。':'连接飞书机器人后，可以直接在飞书里给 Codex 派任务。';
  $('firstConnect').textContent=paired||state.feishu?.has_secret?'查看飞书接入':'连接飞书机器人';
@@ -87,17 +87,17 @@ function renderQuickFeishu() {
  stepState('botStepState',pending.check?'检查中':state.quickDirty?'等待保存':f.bot_ready?'已识别机器人':'待检查',!state.quickDirty&&f.bot_ready?'done':pending.check?'active':'');
  $('quickPair').disabled=!f.bot_ready||!f.bot_open_id||!f.connection_id||state.quickDirty||busy;
  $('quickPair').textContent=pending.pair?'处理中…':active||expired?'重新生成配对码':'生成配对码并启动接收';
- const pairState=pending.pair?'处理中':state.quickDirty?'等待保存':candidate&&active?'待确认':active?'等待消息':expired?'已过期':(f.allowed_open_ids||[]).length?'已绑定':'待配对';
+ const pairState=pending.pair?'处理中':state.quickDirty?'等待保存':candidate&&active?'待确认':active?'等待消息':expired?'已过期':((f.allowed_open_ids||[]).length||(f.allowed_chat_ids||[]).length)?'已绑定':'待配对';
  stepState('pairStepState',pairState,pairState==='已绑定'?'done':pairState==='已过期'?'error':active||pending.pair?'active':'');
  if(candidate&&active){
-  setHtmlIfChanged('quickPairStatus',`✓ 收到配对消息：用户 <code>${esc(candidate.sender_id)}</code>${candidate.chat_type==='group'?`，群 <code>${esc(candidate.chat_id)}</code>`:'，私聊'}。<br><button class="btn primary" id="quickConfirmPair" type="button" style="margin-top:8px" ${pending.pair?'disabled':''}>${pending.pair?'绑定中…':'确认绑定此身份'}</button>`);
+  setHtmlIfChanged('quickPairStatus',`✓ 收到配对消息：用户 <code>${esc(candidate.sender_id)}</code>${candidate.chat_type==='group'?`，群 <code>${esc(candidate.chat_id)}</code>（确认后全群成员可用，同时允许此用户私聊）`:'，私聊'}。<br><button class="btn primary" id="quickConfirmPair" type="button" style="margin-top:8px" ${pending.pair?'disabled':''}>${pending.pair?'绑定中…':'确认授权'}</button>`);
  }else if(active){
   const minutes=Math.max(1,Math.ceil((f.pairing_expires_at-Date.now()/1000)/60));
   setHtmlIfChanged('quickPairStatus',`向机器人发送：<strong style="font-size:17px;letter-spacing:.08em;color:var(--text)">${esc(f.pairing_code)}</strong><br>等待配对消息，约 ${minutes} 分钟后过期。${f.runtime?'当前状态：'+esc(f.runtime):''}`);
  }else if(expired){
   setHtmlIfChanged('quickPairStatus','配对码已过期。点击“重新生成配对码”后，再向机器人发送新码。');
- }else if((f.allowed_open_ids||[]).length){
-  setHtmlIfChanged('quickPairStatus',`✓ 已绑定 ${(f.allowed_open_ids||[]).length} 位用户。现在发送普通飞书消息，在“任务”页查看 Codex 是否收到。`);
+ }else if((f.allowed_open_ids||[]).length||(f.allowed_chat_ids||[]).length){
+  setHtmlIfChanged('quickPairStatus',`✓ 已授权 ${(f.allowed_chat_ids||[]).length} 个群，群内所有成员均可 @机器人创建任务；私聊允许 ${(f.allowed_open_ids||[]).length} 位用户。已有任务仅发起人可继续。`);
  }else{
   setHtmlIfChanged('quickPairStatus','等待机器人就绪后生成配对码。');
  }
@@ -105,12 +105,14 @@ function renderQuickFeishu() {
 function renderFeishu() {
  const f=state.feishu; if(!f)return;
  const runtime=$('feishuRuntime');
- runtime.textContent=f.runtime||'未启动';
+ runtime.textContent=(f.runtime||'').startsWith('进程运行中')?'接收进程运行中':f.runtime||'未启动';
+ runtime.title=f.runtime||'未启动';
+ renderFeishuOverview();
  runtime.className='status '+(f.runtime==='已停用'||f.runtime==='配置错误'?'fail':'wait');
  renderQuickFeishu();
  $('advancedSave').textContent=state.pending.advanced?'保存中…':'保存飞书设置';
  if(!state.promptDirty)$('feishuPrompt').value=f.prompt_template||'';
- if(state.feishuDirty){renderFeishuPromptPreview();return;}
+ if(state.feishuDirty){validateFeishuPrompt();return;}
  if($('feishuAppId').value!==(f.app_id||''))$('feishuAppId').value=f.app_id||'';
  $('feishuSecret').value='';
  $('feishuSecretHint').textContent=f.has_secret?'已有密钥，留空则保留。':'尚未保存密钥。';
@@ -121,7 +123,7 @@ function renderFeishu() {
  $('feishuBotId').value=f.bot_open_id||'';
  if(!state.promptDirty)$('feishuPrompt').value=f.prompt_template||'';
  $('feishuEnabled').checked=!!f.enabled;
- renderFeishuPromptPreview();
+ validateFeishuPrompt();
 }
 async function quickSetup(){
  if(state.pending.setup)return;
@@ -159,18 +161,17 @@ async function quickPair(action){
  }catch(e){feedback('quickPairFeedback',e.message,'error');}
  finally{state.pending.pair=false;renderQuickFeishu();}
 }
-function renderFeishuPromptPreview() {
- const template=$('feishuPrompt').value, sample=$('feishuSample').value, preview=$('feishuPromptPreview');
+function validateFeishuPrompt() {
+ const template=$('feishuPrompt').value;
  let error='';
  if(template.split('{{message}}').length!==2)error='模板需恰好包含一次 {{message}}';
  else if(!template.trim()||template.length>8000)error='模板需为 1 到 8000 字';
- const result=error?'':template.replace('{{message}}',sample);
+ const result=error?'':template.replace('{{message}}','请检查今天的项目进度');
  if(!error){
   const bytes=new TextEncoder().encode(JSON.stringify({message:result,request_id:'fs_'+'x'.repeat(48),task_id:'x'.repeat(100)})).length;
   if(result.length>12000||bytes>16384)error='合成后超过 Bridge 长度限制，请缩短模板或消息。';
  }
- preview.textContent=error||result;
- preview.classList.toggle('preview-error',!!error);
+ feedback('promptValidation',error,'error');
  $('feishuPrompt').setAttribute('aria-invalid',error?'true':'false');
  $('advancedSave').disabled=state.pending.advanced;
  $('savePrompt').disabled=!!error||!!state.pending.prompt;
@@ -188,7 +189,7 @@ async function saveFeishu(e) {
   state.feishuDirty=false;renderFeishu();
   feedback('advancedFeedback','飞书设置已保存。','success');
  }catch(err){feedback('advancedFeedback',err.message,'error');}
- finally{state.pending.advanced=false;renderFeishuPromptPreview();$('advancedSave').textContent='保存飞书设置';}
+ finally{state.pending.advanced=false;validateFeishuPrompt();$('advancedSave').textContent='保存飞书设置';}
 }
 function openOverlay(kind, heading, html) { if(state.drawer?.kind!==kind)feedback('drawerFeedback'); state.drawer={kind,id:state.drawer?.id}; $('drawerHeading').textContent=heading; setHtmlIfChanged('drawerBody',html); $('overlay').classList.add('show'); $('drawer').classList.add('show'); }
 function closeDrawer(){ $('drawer').classList.remove('show'); state.drawer=null; if(!$('modal').classList.contains('show')) $('overlay').classList.remove('show'); }
@@ -274,7 +275,7 @@ async function nextStep(){
 document.addEventListener('click',async e=>{ const target=e.target.closest('button,[data-task],a'); if(!target)return; if(target.id==='quickConfirmPair')return quickPair('confirm'); if(target.dataset.page) return switchPage(target.dataset.page); if(target.dataset.task) return showTask(target.dataset.task); if(target.dataset.approval){ if(state.pending.approval)return; const taskId=state.drawer?.id; state.pending.approval=true; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=true); feedback('drawerFeedback','正在提交决定…'); try{await api('/api/approvals/'+encodeURIComponent(target.dataset.approval),{method:'POST',body:JSON.stringify({decision:target.dataset.decision})}); state.pending.approval=false; await showTask(taskId,false); feedback('drawerFeedback','决定已提交，任务状态已更新。','success');}catch(err){state.pending.approval=false; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=false); feedback('drawerFeedback',err.message,'error');} return; } if(target.dataset.copy) return copyConnection(target.dataset.copy); if(target.dataset.repath) return showSettings(target.dataset.repath,true); if(target.dataset.settings) return showSettings(target.dataset.settings); if(target.dataset.toggle){ try{const c=state.connections.find(x=>x.id===target.dataset.toggle); await api('/api/connections/'+encodeURIComponent(c.id),{method:'PATCH',body:JSON.stringify({status:c.status==='已停用'?'待验证':'已停用'})}); await refresh(); await showSettings(c.id); toast('连接设置已更新');}catch(err){toast(err.message);} return;} if(target.dataset.savePath){try{await api('/api/projects/'+encodeURIComponent(target.dataset.savePath),{method:'PATCH',body:JSON.stringify({path:$('projectPath').value})}); await refresh(); toast('项目位置已更新');}catch(err){toast(err.message);}return;} if(target.id==='showTechnical'){ $('technicalDetails').classList.toggle('hidden'); return $('projectRepair').classList.toggle('hidden'); } });
 $('primaryAction').onclick=openNewConnection; $('firstConnect').onclick=()=>switchPage('feishu'); $('firstOtherConnect').onclick=()=>{switchPage('connections');openNewConnection();}; $('closeDrawer').onclick=closeDrawer; $('closeModal').onclick=closeModal; $('cancelBtn').onclick=closeModal; $('overlay').onclick=()=>{closeDrawer();closeModal();}; $('nextBtn').onclick=nextStep; $('backBtn').onclick=()=>{}; $('sourceName').oninput=()=>{updateRoute();feedback('connectionFeedback');}; $('projectSelect').onchange=()=>{updateRoute();feedback('connectionFeedback');}; $('copyNew').onclick=()=>copyConnection(state.newConnection.id); $('showNewTechnical').onclick=async()=>{const c=await api('/api/connections/'+encodeURIComponent(state.newConnection.id)); $('newTechnical').innerHTML=`<div class="cred-label">接口地址</div><div class="cred-value" style="white-space:normal">${esc(c.endpoint)}</div><div class="cred-label" style="margin-top:12px">密钥</div><div class="cred-value" style="white-space:normal;word-break:break-all">${esc(c.api_key)}</div>`; $('newTechnical').classList.toggle('hidden');}; $('historyToggle').onclick=()=>{state.history=!state.history;renderTasks();}; document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeDrawer();closeModal();}});
 $('feishuForm').addEventListener('submit',saveFeishu);
-$('feishuForm').addEventListener('input',e=>{if(e.target.id!=='feishuSample')state.feishuDirty=true;feedback('advancedFeedback');renderFeishuPromptPreview();});
+$('feishuForm').addEventListener('input',e=>{state.feishuDirty=true;feedback('advancedFeedback');validateFeishuPrompt();});
 const markQuickDirty=()=>{state.quickDirty=true;feedback('quickSetupFeedback');feedback('quickCheckFeedback');feedback('quickPairFeedback');renderQuickFeishu();};
 $('quickAppId').addEventListener('input',markQuickDirty);
 $('quickSecret').addEventListener('input',markQuickDirty);
@@ -287,11 +288,30 @@ switchPage(state.page);refresh();setInterval(refresh,3000);
 $('startupNotice').hidden=true;
 $('panelRoot').hidden=false;
 
-$('promptForm').addEventListener('input',e=>{if(e.target.id!=='feishuSample')state.promptDirty=true;feedback('promptFeedback');renderFeishuPromptPreview();});
+$('promptForm').addEventListener('input',e=>{state.promptDirty=true;feedback('promptFeedback');validateFeishuPrompt();});
 $('promptForm').addEventListener('submit',async e=>{
- e.preventDefault();if(state.pending.prompt||!renderFeishuPromptPreview())return;
+ e.preventDefault();if(state.pending.prompt||!validateFeishuPrompt())return;
  state.pending.prompt=true;$('savePrompt').disabled=true;$('savePrompt').textContent='保存中…';
  try{await api('/api/feishu',{method:'PATCH',body:JSON.stringify({prompt_template:$('feishuPrompt').value})});state.promptDirty=false;await refresh(true);feedback('promptFeedback','已保存。之后收到的新消息使用这个 Prompt。','success');}
  catch(err){feedback('promptFeedback',err.message,'error');}
  finally{state.pending.prompt=false;$('savePrompt').disabled=false;$('savePrompt').textContent='保存 Prompt';}
 });
+
+// Presentation only: disclosure state never writes connection settings.
+function renderFeishuOverview() {
+ const f=state.feishu;if(!f)return;
+ const connection=state.connections.find(c=>c.id===f.connection_id);
+ const configured=!!(f.has_secret && f.bot_ready && connection && (f.allowed_open_ids?.length || f.allowed_chat_ids?.length));
+ const pairing=!!(f.pairing_code && f.pairing_expires_at>Date.now()/1000);
+ $('feishuOverviewTitle').textContent=configured?(f.bot_name||'飞书机器人')+' → '+connection.project_name:'完成飞书接入';
+ $('feishuOverviewSummary').textContent=configured?
+  `已配置 · ${f.allowed_chat_ids?.length||0} 个群（全员可用） · ${f.allowed_open_ids?.length||0} 位私聊用户。${f.enabled?'在飞书发送消息，在任务页查看结果。':'接收已停用，可在高级设置中启用。'}`:
+  '展开连接与配对设置，完成应用接入后即可接收任务。';
+ $('feishuPage').classList.toggle('needs-setup',!configured);
+ $('connectionDetailsHint').textContent=pairing?'正在配对':configured?'已配置，按需展开':'需要配置';
+ const disclosureKey=[configured,pairing,!!f.pairing_candidate].join(':');
+ if(state.feishuDisclosureKey!==disclosureKey){
+  $('connectionDetails').open=!configured||pairing;
+  state.feishuDisclosureKey=disclosureKey;
+ }
+}

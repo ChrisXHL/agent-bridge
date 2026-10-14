@@ -76,13 +76,70 @@ class FeishuBridgeTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def group_event(self, message_id, sender="ou_member", chat="oc_team", parent=None):
+        return event(message_id, sender=sender, chat=chat, chat_type="group",
+                     text="@_user_1 检查项目", parent=parent,
+                     mentions=[{"id": {"open_id": "ou_bot"}, "key": "@_user_1"}])
+
+    def test_group_member_without_personal_pairing_can_create_task(self):
+        self.config["allowed_open_ids"] = []
+        self.assertTrue(self.adapter.handle_event(self.group_event("om_member")))
+        self.adapter.pump_once()
+        self.assertEqual(len(self.bridge.tasks), 1)
+        self.assertEqual(self.inbox.linked_source("om_member")["sender_id"], "ou_member")
+        self.assertEqual(self.config["allowed_open_ids"], [])
+
+    def test_unlisted_group_is_rejected_even_for_personally_paired_user(self):
+        for sender in ("ou_member", "ou_owner"):
+            self.assertFalse(self.adapter.handle_event(
+                self.group_event("om_other_" + sender, sender=sender, chat="oc_other")))
+        self.assertEqual(self.inbox.pending(), [])
+
+    def test_group_member_still_needs_bot_mention(self):
+        self.assertFalse(self.adapter.handle_event(event(
+            "om_missing_at", sender="ou_member", chat="oc_team", chat_type="group")))
+        self.assertFalse(self.adapter.handle_event(event(
+            "om_wrong_at", sender="ou_member", chat="oc_team", chat_type="group",
+            text="@_user_1 hi", mentions=[{"id":{"open_id":"ou_someone"},"key":"@_user_1"}])))
+
+    def test_group_membership_does_not_grant_private_access(self):
+        self.assertTrue(self.adapter.handle_event(self.group_event("om_group_access")))
+        self.assertFalse(self.adapter.handle_event(event("om_dm", sender="ou_member")))
+        self.assertTrue(self.adapter.handle_event(event("om_owner_dm", sender="ou_owner")))
+
+    def test_group_task_stays_owned_by_original_sender(self):
+        self.adapter.handle_event(self.group_event("om_original"))
+        self.adapter.pump_once()
+        tid = self.inbox.linked_source("om_original")["task_id"]
+        self.bridge.tasks[tid] = {"status":"已完成", "result":"done"}
+        self.adapter.pump_once()
+        reply = self.inbox.linked_source("om_original")["outbound_id"]
+        for parent in ("om_original", reply):
+            self.assertFalse(self.adapter.handle_event(
+                self.group_event("om_hijack_" + parent, sender="ou_other", parent=parent)))
+        self.assertTrue(self.adapter.handle_event(self.group_event("om_own_reply", parent=reply)))
+        self.adapter.pump_once()
+        self.assertEqual(self.inbox.linked_source("om_own_reply")["task_id"], tid)
+        self.assertTrue(self.adapter.handle_event(self.group_event("om_new_task", sender="ou_other")))
+        self.adapter.pump_once()
+        self.assertNotEqual(self.inbox.linked_source("om_new_task")["task_id"], tid)
+
+    def test_same_sender_cannot_continue_task_from_different_allowed_group(self):
+        self.config["allowed_chat_ids"].append("oc_other_allowed")
+        self.adapter.handle_event(self.group_event("om_original"))
+        self.adapter.pump_once()
+        self.assertFalse(self.adapter.handle_event(self.group_event(
+            "om_cross_group", chat="oc_other_allowed", parent="om_original")))
+
     def test_dedup_submit_and_final_reply(self):
         self.assertTrue(self.adapter.handle_event(event()))
         self.assertFalse(self.adapter.handle_event(event()))
         self.assertEqual(len(self.inbox.pending()), 1)
         self.adapter.pump_once()
         self.assertEqual(len(self.bridge.requests), 1)
-        self.assertEqual(self.bridge.submissions[0][0], DEFAULT_PROMPT_TEMPLATE.replace("{{message}}", "检查项目"))
+        self.assertTrue(self.bridge.submissions[0][0].startswith(
+            DEFAULT_PROMPT_TEMPLATE.replace("{{message}}", "检查项目") + "\n\n[Codex Bridge 来源信息"))
+        self.assertIn('"source_message_id": "om_first"', self.bridge.submissions[0][0])
         task_id = self.inbox.submitted()[0]["task_id"]
         self.bridge.tasks[task_id] = {"status": "已完成", "result": "完成核验"}
         self.adapter.pump_once()
@@ -126,7 +183,8 @@ class FeishuBridgeTests(unittest.TestCase):
         self.adapter.handle_event(event())
         self.config["prompt_template"] = "修改后的规则：{{message}}"
         self.adapter.pump_once()
-        self.assertEqual(self.bridge.submissions[0][0], "项目规则：先核对事实。\n请求：检查项目")
+        self.assertTrue(self.bridge.submissions[0][0].startswith(
+            "项目规则：先核对事实。\n请求：检查项目\n\n[Codex Bridge 来源信息"))
 
     def test_prompt_respects_bridge_request_size(self):
         with self.assertRaises(BridgeError):
@@ -382,10 +440,8 @@ class FeishuBridgeTests(unittest.TestCase):
             self.assertTrue(adapter.handle_event(event("om_contract", text="执行检查")))
             adapter.pump_once()
             linked = self.inbox.submitted()[0]
-            self.assertEqual(
-                store.task(linked["task_id"])["messages"][0]["content"],
-                "固定规则\n执行检查",
-            )
+            self.assertTrue(store.task(linked["task_id"])["messages"][0]["content"].startswith(
+                "固定规则\n执行检查\n\n[Codex Bridge 来源信息"))
         finally:
             server.shutdown()
             server.server_close()

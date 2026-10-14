@@ -38,7 +38,8 @@ class RpcError(Exception):
 
 class AppServerClient:
     def __init__(self, codex_bin="codex", timeout=25, on_server_request=None):
-        self.codex_bin, self.timeout = codex_bin, timeout
+        from codex_runtime import resolve_codex_binary
+        self.codex_bin, self.timeout = resolve_codex_binary(codex_bin), timeout
         self.on_server_request = on_server_request
         self.proc = None
         self.pending = {}

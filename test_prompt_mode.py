@@ -38,7 +38,8 @@ class PromptModeTests(unittest.TestCase):
             routes=[{'chat_id':'oc_private','prompt_template':'OLD {{message}}','workflow':{'name':'old'}}])
         self.assertTrue(self.adapter.handle_event(event()))
         self.adapter.pump_once()
-        self.assertEqual(self.bridge.submissions[0][0],'RULES\n检查项目')
+        self.assertTrue(self.bridge.submissions[0][0].startswith('RULES\n检查项目\n\n[Codex Bridge 来源信息'))
+        self.assertIn('"source_message_id": "om_first"', self.bridge.submissions[0][0])
 
     def test_fresh_inbox_has_no_card_or_workflow_tables(self):
         with self.inbox.db() as db:

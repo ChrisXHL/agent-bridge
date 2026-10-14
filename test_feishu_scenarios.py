@@ -154,7 +154,8 @@ class FeishuScenarioTests(unittest.TestCase):
         task = self.store.tasks()[0]
         self.assertEqual(task["status"], "等待 Codex")
         content=self.store.task(task["id"])["messages"][0]["content"]
-        self.assertEqual(content,"固定规则：检查项目")
+        self.assertTrue(content.startswith("固定规则：检查项目\n\n[Codex Bridge 来源信息"))
+        self.assertIn('"source_message_id": "om_task"', content)
         self.assertNotIn("bridge_send_card",content)
 
     def test_08_unknown_private_sender_is_ignored(self):

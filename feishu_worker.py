@@ -225,6 +225,8 @@ class FeishuAdapter:
         return self.clients[connection_id]
 
     def handle_event(self, payload):
+        if (payload.get('header') or {}).get('app_id') not in (None, self.config.get('app_id')):
+            return False
         event = payload.get("event") or {}
         message = event.get("message") or {}
         sender = event.get("sender") or {}
@@ -262,22 +264,37 @@ class FeishuAdapter:
                 "message_id": message_id, "code": pairing_code,
                 "sender_id": sender_id, "chat_id": chat_id, "chat_type": chat_type,
             })
-        if sender_id not in self.config.get("allowed_open_ids", []):
-            return False
-        if chat_type == "group" and chat_id not in self.config.get("allowed_chat_ids", []):
+        # Group authorization covers all members; personal authorization is for DMs.
+        # Follow-ups still require the original sender and chat below.
+        if chat_type == "group":
+            if chat_id not in self.config.get("allowed_chat_ids", []):
+                return False
+        elif sender_id not in self.config.get("allowed_open_ids", []):
             return False
         route = {'mode': 'prompt', 'connection_id': self.config.get('connection_id'),
                  'prompt_template': self.config.get('prompt_template', DEFAULT_PROMPT_TEMPLATE)}
-        parent = self.inbox.linked_source(message.get('parent_id') or message.get('root_id'))
+        group = (self.config.get('group_configs') or {}).get(chat_id, {}) if chat_type == 'group' else {}
+        if group.get('enabled') is False:
+            return False
+        route.update({k: group[k] for k in ('connection_id', 'prompt_template', 'name') if k in group})
+        parent = (self.inbox.linked_source(message.get('parent_id'))
+                  or self.inbox.linked_source(message.get('root_id')))
         if parent:
-            if parent['chat_id'] != chat_id or parent['sender_id'] != sender_id:
+            if (parent['chat_id'] != chat_id or parent['sender_id'] != sender_id
+                    or parent.get('app_id') not in (None, self.config.get('app_id'))):
                 return False
             # Old tasks are read-only after the switch; start a fresh message instead.
             if not prompt_source(parent):
                 return False
+            frozen = json.loads(parent.get('route_json') or '{}')
+            route.update({k: frozen[k] for k in ('connection_id', 'prompt_template', 'name') if k in frozen})
             route['connection_id'] = parent.get('connection_id') or route['connection_id']
         try:
-            prompt = render_prompt(route['prompt_template'], body)
+            prompt = render_prompt(route['prompt_template'], body, {
+                'source_message_id': message_id, 'chat_id': chat_id,
+                'app_id': self.config.get('app_id'),
+                'parent_id': message.get('parent_id'), 'root_id': message.get('root_id'),
+            })
         except BridgeError:
             LOG.warning("Feishu message exceeds the Bridge prompt limit message_id=%s", message_id)
             return False
@@ -292,7 +309,7 @@ class FeishuAdapter:
 
     def pump_once(self):
         for item in self.inbox.submitted():
-            if not prompt_source(item):
+            if not prompt_source(item) or item.get('app_id') != self.config.get('app_id'):
                 continue
             try:
                 task = self.client_for(item.get('connection_id')).task(item['task_id'])
@@ -307,10 +324,10 @@ class FeishuAdapter:
                 LOG.exception('Could not notify Feishu message_id=%s', item['message_id'])
 
         for item in self.inbox.pending():
-            if not prompt_source(item):
+            if not prompt_source(item) or item.get('app_id') != self.config.get('app_id'):
                 continue
             parent_id = item['parent_id'] or item['root_id']
-            parent = self.inbox.linked_source(parent_id)
+            parent = self.inbox.linked_source(item['parent_id']) or self.inbox.linked_source(item['root_id'])
             parent_task = parent.get('task_id') if parent else None
             if parent and not parent_task:
                 continue
