@@ -9,6 +9,31 @@ from codex_http_bridge import BridgeError
 BASE = "https://open.feishu.cn/open-apis"
 
 
+def check_topic_permissions(app_id,app_secret,*,opener=request.urlopen):
+    """Use the app's actual granted scopes, not a saved checkbox or inferred ability."""
+    auth=_call('/auth/v3/tenant_access_token/internal',body={'app_id':app_id,'app_secret':app_secret},opener=opener)
+    if auth.get('code')!=0 or not auth.get('tenant_access_token'):raise BridgeError(400,'feishu_credentials_rejected','飞书未接受此应用凭据。')
+    result=_call('/application/v6/scopes',token=auth['tenant_access_token'],opener=opener)
+    if result.get('code')!=0:raise BridgeError(409,'topic_permissions_unverified','暂时无法核实群消息权限，请稍后重试。')
+    granted={x.get('scope_name') for x in (result.get('data') or {}).get('scopes',[]) if x.get('scope_type')=='tenant' and x.get('grant_status')==1}
+    missing=[]
+    if 'im:message.group_msg' not in granted:missing.append('接收群聊中所有消息事件（im:message.group_msg）')
+    if not granted.intersection({'im:message:readonly','im:message','im:message.history:readonly'}):missing.append('获取单聊、群组消息（im:message:readonly）')
+    if missing:raise BridgeError(409,'topic_permissions_missing','话题续聊需要 '+ '、'.join(missing)+'，请在飞书开通并确保生效，再保存此群。Bridge 只处理被 @ 后的话题及其回复。\nhttps://open.feishu.cn/app/'+app_id+'/auth')
+    return {'verified':True}
+
+
+def chat_name(app_id, app_secret, chat_id, *, opener=request.urlopen):
+    """The group's display name as the bot sees it, or None when it cannot be read."""
+    try:
+        auth = _call('/auth/v3/tenant_access_token/internal', body={'app_id': app_id, 'app_secret': app_secret}, opener=opener)
+        result = _call('/im/v1/chats/' + chat_id, token=auth.get('tenant_access_token', ''), opener=opener)
+    except Exception:
+        return None
+    name = ((result.get('data') or {}).get('name') or '').strip() if result.get('code') == 0 else ''
+    return name[:60] or None
+
+
 def _call(path, *, body=None, token=None, opener=request.urlopen):
     headers = {"Content-Type": "application/json; charset=utf-8"}
     if token:

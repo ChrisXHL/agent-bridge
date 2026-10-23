@@ -1,13 +1,13 @@
 {
   "name": "codex-bridge-v2",
-  "version": "2.4.0",
+  "version": "2.6.2",
   "description": "Local Feishu-to-Codex tasks controlled by editable prompts",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "Codex Bridge 2.4",
+    "displayName": "Agent Bridge",
     "shortDescription": "外部任务连接器",
     "longDescription": "接收飞书消息，填入可编辑 Prompt，在 Codex 任务中执行并回复结果。",
     "developerName": "Local developer",
@@ -17,8 +17,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "打开 Codex Bridge 面板",
-      "查看外部任务"
+      "安装并接入 Agent Bridge",
+      "创建飞书助手管理员",
+      "打开 Agent Bridge 面板"
     ]
   },
   "mcpServers": "./.mcp.json"

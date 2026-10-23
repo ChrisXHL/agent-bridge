@@ -4,9 +4,11 @@
       "command": "./scripts/launch-mcp",
       "args": [],
       "cwd": ".",
-      "env_vars": ["BRIDGE_PORT"],
+      "env_vars": [
+        "BRIDGE_PORT"
+      ],
       "startup_timeout_sec": 10,
-      "tool_timeout_sec": 15
+      "tool_timeout_sec": 60
     }
   }
 }

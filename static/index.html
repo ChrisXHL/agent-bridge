@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Bridge 2.4 · 外部任务连接器</title><link rel="stylesheet" href="/static/style.css"></head>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Bridge · 外部任务连接器</title><link rel="stylesheet" href="/static/style.css"></head>
 <body>
 <section id="startupNotice" style="max-width:520px;margin:12vh auto;padding:28px;font:15px/1.7 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;color:#171717;background:#fff;border:1px solid #e7e5e4;border-radius:16px">
-  <h1 style="font-size:22px;margin:0 0 12px">打开 Codex Bridge 2.4</h1>
+  <h1 style="font-size:22px;margin:0 0 12px">打开 Agent Bridge</h1>
   <p>面板需要通过本机服务打开。直接打开 HTML 源文件无法加载完整界面和连接状态。</p>
   <a href="http://127.0.0.1:8797/panel" style="display:inline-block;margin:8px 0;padding:10px 16px;border-radius:10px;background:#111;color:#fff;text-decoration:none">打开本机面板</a>
   <p style="font-size:13px;color:#737373">如果已通过服务打开，请刷新页面；仍未加载时，请检查 Bridge 服务是否正在运行。</p>
@@ -10,7 +10,7 @@
 <div id="panelRoot" hidden>
 <div class="app">
   <aside class="sidebar">
-    <div class="brand"><div class="logo">CB</div><div class="brand-copy"><div class="brand-text">Codex Bridge 2.4</div><div class="brand-sub">本机飞书接入</div></div></div>
+    <div class="brand"><div class="logo">AB</div><div class="brand-copy"><div class="brand-text">Agent Bridge</div><div class="brand-sub">本机飞书接入</div></div></div>
     <nav class="nav"><button id="navTasks" class="active" data-page="tasks" aria-label="任务" title="任务"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 6.5h14M5 12h14M5 17.5h9"/></svg><span>任务</span></button><button id="navConnections" data-page="connections" aria-label="连接" title="连接"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 12h8M12 8v8"/><rect x="3" y="3" width="18" height="18" rx="5"/></svg><span>连接</span></button><button id="navFeishu" data-page="feishu" aria-label="飞书" title="飞书"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16v12H4zM4 8l8 6 8-6"/></svg><span>飞书</span></button></nav>
   </aside>
   <main class="main"><header class="topbar"><div class="title-wrap"><h1 id="pageTitle">任务</h1><p id="pageSubtitle">外部系统交给 Codex 的任务。</p></div><div class="top-actions"><button class="btn primary hidden" id="primaryAction">+ 创建连接</button></div></header>
@@ -21,6 +21,7 @@
     </div>
     <div id="connectionsPage" class="hidden"><div class="toolbar"><div><div style="font-size:14px;font-weight:700">谁可以给哪个 Codex 项目派任务</div><div style="font-size:12px;color:var(--muted);margin-top:5px">每个连接只对应一个项目。</div></div></div><div class="connections-grid" id="connectionsGrid"></div></div>
     <div id="feishuPage" class="hidden">
+      <section id="assistantWorkspace" aria-label="创建飞书助手"></section>
       <section id="groupsWorkspace" class="hidden" aria-label="群配置"></section>
       <section class="feishu-overview" aria-label="接入概况">
         <div class="feishu-overview-top"><strong id="feishuOverviewTitle">飞书接入</strong><span id="feishuRuntime" class="status wait">读取状态…</span></div>
@@ -83,4 +84,4 @@
 <div class="overlay" id="overlay"></div>
 <aside class="drawer" id="drawer"><div class="drawer-head"><strong id="drawerHeading">任务详情</strong><button class="icon-btn" id="closeDrawer" aria-label="关闭">✕</button></div><div class="drawer-body" id="drawerBody"></div><div id="drawerFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div></aside>
 <div class="modal" id="modal"><div class="modal-head"><div class="modal-title">创建连接</div><button class="icon-btn" id="closeModal" aria-label="关闭">✕</button></div><div class="modal-body"><div class="steps"><div class="step active" id="stepBar1"></div><div class="step" id="stepBar2"></div></div><div id="step1"><div class="hero-copy"><h2>创建连接</h2><p>告诉我们谁会发任务，以及这些任务应该进入哪个 Codex 项目。</p></div><div class="field"><label for="sourceName">任务来源</label><input class="input" id="sourceName" placeholder="例如：守望系统、手机助手、自动化脚本"></div><div class="field"><label for="projectSelect">Codex 项目</label><select class="select" id="projectSelect"></select></div><div class="field"><label style="color:var(--muted);font-weight:500">连接关系</label><div class="project-option selected" style="cursor:default"><div class="project-info"><strong id="routePreview"></strong><span>这个来源以后只能给这个项目派任务</span></div><span>✓</span></div></div><div id="connectionFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div></div><div id="step2" class="hidden"><div class="hero-copy"><h2>连接已创建</h2><p>把连接信息交给任务来源。第一条真实任务进入 Codex 后，状态会自动变成“可用”。</p></div><div class="project-option selected" style="cursor:default;margin-top:18px"><div class="project-info"><strong id="finalRoute"></strong><span>等待第一条真实任务验证</span></div><div class="status wait"><span class="s-dot"></span>待验证</div></div><button class="btn primary" style="width:100%;justify-content:center;margin-top:14px" id="copyNew">复制连接信息</button><div style="font-size:11px;color:var(--muted);margin-top:10px;text-align:center">复制后去任务来源完成配置；你也可以稍后再设置。</div><div style="margin-top:10px;text-align:center"><button class="mini-link" id="showNewTechnical">查看技术信息</button></div><div id="newTechnical" class="hidden cred"></div></div></div><div class="modal-foot"><button class="btn ghost" id="backBtn">返回</button><div style="display:flex;gap:8px"><button class="btn" id="cancelBtn">取消</button><button class="btn primary" id="nextBtn">创建连接</button></div></div></div>
-<div class="toast" id="toast"></div></div><script src="/static/app.js"></script><script src="/static/feishu-groups.js"></script></body></html>
+<div class="toast" id="toast"></div></div><script src="/static/app.js"></script><script src="/static/feishu-groups.js"></script><script src="/static/assistants.js"></script></body></html>

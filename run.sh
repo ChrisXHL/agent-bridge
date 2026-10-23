@@ -2,6 +2,8 @@
 set -eu
 umask 077
 cd "$(dirname "$0")"
+PATH="$PWD/.tools/node_modules/.bin:$PWD/.venv/bin:$PATH"
+export PATH
 if [ -f .env ]; then
   set -a
   . ./.env

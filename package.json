@@ -1,0 +1,10 @@
+{
+  "name": "codex-feishu-bridge",
+  "private": true,
+  "version": "2.6.2",
+  "description": "Local Feishu bot onboarding for Codex Bridge",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.76.0",
+    "qrcode": "1.5.4"
+  }
+}

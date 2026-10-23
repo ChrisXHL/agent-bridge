@@ -30,6 +30,10 @@ from feishu_supervisor import FeishuSupervisor, MultiFeishuSupervisor
 from feishu_groups import GroupSettings
 from feishu_worker import Inbox
 from legacy_history import LegacyHistory
+from assistant_onboarding import AssistantOnboarding
+from assistant_manager import AssistantManager
+from assistant_collaboration import AssistantCollaboration, install as install_collaboration, CHILD_SLOTS
+import claude_runtime
 
 LOG = logging.getLogger("codex_bridge")
 ROOT = Path(__file__).resolve().parent
@@ -38,7 +42,7 @@ MAX_BODY = 16 * 1024
 CODEX_APPROVAL_POLICY = "never"
 CODEX_SANDBOX_MODE = "danger-full-access"
 CODEX_REASONING_EFFORT = "medium"
-MAX_ACTIVE_TASKS = 2
+MAX_ACTIVE_TASKS = int(os.getenv("BRIDGE_MAX_ACTIVE_TASKS", "5"))
 TARGET_NOFILE_LIMIT = 4096
 
 
@@ -151,6 +155,7 @@ class Store:
     def _init(self):
         with self.db() as db:
             db.execute("PRAGMA journal_mode=WAL")
+            install_collaboration(db)
             db.executescript("""
             CREATE TABLE IF NOT EXISTS connections (
               id TEXT PRIMARY KEY, source TEXT NOT NULL, project_id TEXT NOT NULL,
@@ -188,6 +193,7 @@ class Store:
 
     def _codex_projects(self):
         """Read local Codex projects on each request so new projects appear immediately."""
+        if os.getenv('BRIDGE_PROJECT_DISCOVERY')=='0':return []
         state_path = self.codex_state_path
         if state_path is None:
             codex_home = Path(os.getenv("CODEX_HOME", Path.home() / ".codex"))
@@ -262,6 +268,25 @@ class Store:
         temp.replace(self.projects_path)
         return self.project(project_id)
 
+    def add_project(self, path):
+        """Register a folder the user picked; reuse the existing entry for the same folder."""
+        if not isinstance(path, str) or not Path(path).is_absolute() or not Path(path).is_dir():
+            raise BridgeError(400, "invalid_project_path", "请选择现有的文件夹")
+        resolved = str(Path(path).resolve(strict=True))
+        for item in self.projects():
+            try:
+                if str(Path(item["path"]).resolve()) == resolved:
+                    return item
+            except OSError:
+                continue
+        raw = json.loads(self.projects_path.read_text(encoding="utf-8")) if self.projects_path.exists() else {}
+        project_id = "local-" + digest(resolved)[:12]
+        raw[project_id] = resolved
+        temp = self.projects_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temp.replace(self.projects_path)
+        return self.project(project_id)
+
     def create_connection(self, source, project_id):
         if not isinstance(source, str) or not 1 <= len(source.strip()) <= 60:
             raise BridgeError(400, "invalid_source", "请填写任务来源")
@@ -317,7 +342,7 @@ class Store:
         return self.connection(cid)
 
     def submit(self, connection, payload, request_id):
-        if not isinstance(payload, dict) or set(payload) - {"task_id", "message", "request_id"}:
+        if not isinstance(payload, dict) or set(payload) - {"task_id", "message", "request_id", "continue_from"}:
             raise BridgeError(400, "invalid_request", "任务内容格式无效")
         message = payload.get("message")
         if not isinstance(message, str) or not 1 <= len(message.strip()) <= 12000:
@@ -325,11 +350,18 @@ class Store:
         if not isinstance(request_id, str) or not 8 <= len(request_id) <= 128 or not all(x.isalnum() or x in "-_.:" for x in request_id):
             raise BridgeError(400, "invalid_request_id", "request_id 需为 8 到 128 位字母、数字或 -_.:")
         requested_task = payload.get("task_id")
+        continue_from = payload.get('continue_from')
+        if continue_from is not None and (not isinstance(continue_from, str) or not continue_from or len(continue_from)>100 or requested_task):
+            raise BridgeError(400, 'invalid_conversation', '连续对话的来源任务无效')
         if requested_task is not None and (not isinstance(requested_task, str) or len(requested_task) > 100):
             raise BridgeError(400, "invalid_task_id", "task_id 无效")
         if requested_task and requested_task in self.history.tasks():
             raise BridgeError(409, "historical_task", "旧版任务仅供查看，请从飞书发送新消息创建任务")
+        if continue_from and continue_from in self.history.tasks():
+            raise BridgeError(409, 'historical_task', '旧版归档任务不能续接')
         fingerprint = digest(json.dumps([requested_task, message], ensure_ascii=False))
+        if continue_from:
+            fingerprint = digest(json.dumps([requested_task, message, continue_from], ensure_ascii=False))
         cid = connection["id"]
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -345,9 +377,21 @@ class Store:
                     raise BridgeError(404, "task_not_found", "这个连接中没有该任务")
                 task_id = task["id"]
             else:
+                thread_id = None
+                if continue_from:
+                    previous = db.execute('SELECT * FROM tasks WHERE id=? AND connection_id=?', (continue_from,cid)).fetchone()
+                    if not previous:
+                        raise BridgeError(404,'task_not_found','这个连接中没有该对话')
+                    if previous['status'] not in ('已完成','失败','已停止'):
+                        raise BridgeError(409,'conversation_busy','前一条消息尚未处理完成')
+                    thread_id = previous['thread_id']
+                    if thread_id and db.execute("SELECT 1 FROM tasks WHERE thread_id=? AND status IN ('执行中','等待 Codex','需要你处理')",(thread_id,)).fetchone():
+                        raise BridgeError(409,'conversation_busy','这个对话仍有消息在处理')
                 task_id = "task_" + uuid.uuid4().hex[:20]
                 t = now()
-                db.execute("INSERT INTO tasks VALUES (?,?,NULL,'等待 Codex',NULL,NULL,?,?)", (task_id, cid, t, t))
+                # Keep each delivery and collaboration budget separate. Only the
+                # Codex conversation is continued; completed records stay immutable.
+                db.execute("INSERT INTO tasks VALUES (?,?,?,'等待 Codex',NULL,NULL,?,?)", (task_id, cid, thread_id, t, t))
             t = now()
             db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,'queued',NULL,?,?)",
                        ("msg_" + uuid.uuid4().hex[:20], task_id, cid, request_id, fingerprint, message.strip(), t, t))
@@ -356,11 +400,11 @@ class Store:
 
     def tasks(self):
         with self.db() as db:
-            rows = db.execute("""SELECT t.*, c.source,c.project_id FROM tasks t JOIN connections c ON c.id=t.connection_id ORDER BY t.updated_at DESC""").fetchall()
+            rows = db.execute("""SELECT t.*, c.source,c.project_id,(SELECT target_name FROM assistant_calls a WHERE a.child_task=t.id) AS collaborator_name FROM tasks t JOIN connections c ON c.id=t.connection_id ORDER BY t.updated_at DESC""").fetchall()
             first = {r["task_id"]:r["content"] for r in db.execute("SELECT task_id,content FROM messages ORDER BY created_at DESC")}
         names = {p["id"]:p["name"] for p in self.projects()}
         archived = self.history.tasks()
-        return [{**dict(r), **archived.get(r["id"], {}), "title": first.get(r["id"], ""), "project_name": names.get(r["project_id"], r["project_id"])} for r in rows]
+        return [{**dict(r), **archived.get(r["id"], {}), "title": ("协作 · "+r["collaborator_name"]) if r["collaborator_name"] else first.get(r["id"], ""), "project_name": names.get(r["project_id"], r["project_id"])} for r in rows]
 
     def task(self, task_id, connection_id=None):
         with self.db() as db:
@@ -370,12 +414,16 @@ class Store:
                 row = db.execute("SELECT t.*,c.source,c.project_id FROM tasks t JOIN connections c ON c.id=t.connection_id WHERE t.id=?", (task_id,)).fetchone()
             messages = [dict(r) for r in db.execute("SELECT id,content,delivery,created_at,turn_id FROM messages WHERE task_id=? ORDER BY created_at", (task_id,))]
             approval = db.execute("SELECT id,method,detail,state FROM approvals WHERE task_id=? ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+            parent = db.execute('SELECT parent_task,target_name FROM assistant_calls WHERE child_task=?',(task_id,)).fetchone()
+            children = [dict(r) for r in db.execute('SELECT c.child_task AS id,c.target_name AS name,t.status,t.error_code FROM assistant_calls c JOIN tasks t ON t.id=c.child_task WHERE c.parent_task=? ORDER BY c.created_at',(task_id,))]
         if not row:
             raise BridgeError(404, "task_not_found", "任务不存在")
         obj = {**dict(row), **self.history.tasks().get(task_id, {})}
         obj["messages"] = messages
+        obj['collaboration']={'parent_task_id':parent['parent_task'],'name':parent['target_name']} if parent else None
+        obj['children']=children
         obj["approval"] = dict(approval) if approval and approval["state"] == "pending" else None
-        obj["title"] = messages[0]["content"] if messages else ""
+        obj["title"] = ("协作 · "+parent["target_name"]) if parent else (messages[0]["content"] if messages else "")
         obj["project_name"] = next((p["name"] for p in self.projects() if p["id"] == obj["project_id"]), obj["project_id"])
         return obj
 
@@ -429,6 +477,7 @@ class Engine:
         self.worker = None
         self.history = LegacyHistory(history_inbox_path) if history_inbox_path else store.history
         self.archived_tasks = {}
+        self.collaboration = None
         if hasattr(self.transport, "client"):
             self.transport.client.on_server_request = self._on_server_request
 
@@ -534,7 +583,12 @@ class Engine:
             items = last.get("items") or []
             final = next((x.get("text") for x in reversed(items) if x.get("type") == "agentMessage" and x.get("text")), None)
             if state == "completed":
-                self.store.set_task(row["id"], "已完成", final)
+                if self.collaboration and self.collaboration.topics.pause_for_question(row['id']):
+                    continue
+                if self.collaboration and not self.collaboration.all_collected(row['id']):
+                    if not self.collaboration.pause_for_authorization(row['id']):
+                        self.store.set_task(row['id'],'失败','主助手提前结束，尚未收齐协作结果，请查看子任务状态。','collaboration_incomplete')
+                else:self.store.set_task(row["id"], "已完成", final)
             elif state == "failed":
                 self.store.set_task(row["id"], "失败", str(last.get("error") or "Codex 执行失败"), "codex_failed")
             elif state == "interrupted":
@@ -550,17 +604,24 @@ class Engine:
 
     def _deliver_one(self):
         with self.store.db() as db:
-            active = sum(r[0] not in self.archived_tasks for r in db.execute("SELECT id FROM tasks WHERE status IN ('执行中','需要你处理')"))
-            if active >= self.max_active:
-                return
-            rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,c.project_id
+            # An unresolved delivery receipt is not a running turn. Preserve
+            # the record; actual Codex approvals still reserve their slot.
+            active_rows=db.execute("""SELECT id, COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=tasks.id),0) AS depth
+                FROM tasks WHERE status IN ('执行中','需要你处理')
+                AND NOT (status='需要你处理' AND COALESCE(error_code,'') IN ('delivery_uncertain','assistant_authorization_required','group_question_pending')
+                    AND NOT EXISTS (SELECT 1 FROM approvals WHERE task_id=tasks.id AND state='pending'))""").fetchall()
+            active_by_depth={depth:sum(r['id'] not in self.archived_tasks and r['depth']==depth for r in active_rows) for depth in range(4)}
+            rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,c.project_id,
+                COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=t.id),0) AS depth
                 FROM messages m JOIN tasks t ON t.id=m.task_id JOIN connections c ON c.id=t.connection_id
-                WHERE m.delivery='queued' AND c.status!='已停用'
+                WHERE m.delivery='queued' AND (c.status!='已停用' OR EXISTS(SELECT 1 FROM assistant_calls a WHERE a.child_task=t.id))
                 AND NOT EXISTS (SELECT 1 FROM messages older WHERE older.task_id=m.task_id AND older.created_at<m.created_at AND older.delivery IN ('queued','sending','uncertain'))
-                ORDER BY m.created_at""").fetchall()
+                ORDER BY EXISTS(SELECT 1 FROM assistant_resume_messages r WHERE r.message_id=m.id) DESC,m.created_at""").fetchall()
         for row in rows:
             if row['task_id'] in self.archived_tasks:
                 continue
+            if self.collaboration and not self.collaboration.may_deliver(dict(row)):continue
+            if active_by_depth.get(row['depth'],0)>=(CHILD_SLOTS if row['depth'] else self.max_active):continue
             if self._deliver_message(dict(row)):
                 return
 
@@ -607,7 +668,8 @@ class Engine:
                 thread_id = self.transport.start_thread(cwd)
                 with self.store.db() as db:
                     db.execute("UPDATE tasks SET thread_id=?,updated_at=? WHERE id=?", (thread_id, now(), msg["task_id"]))
-            turn_id = self.transport.send(thread_id, msg["content"])
+            content=self.collaboration.prepare(msg) if self.collaboration else msg['content']
+            turn_id = self.transport.send(thread_id, content)
             with self.store.db() as db:
                 db.execute("UPDATE messages SET delivery='delivered',turn_id=?,updated_at=? WHERE id=?", (turn_id, now(), msg["id"]))
                 db.execute("""UPDATE tasks SET
@@ -661,6 +723,10 @@ def make_handler(store, engine, base_url, allowed_host=None,
                  feishu_settings_path=None, feishu_supervisor=None, feishu_inbox_path=None):
     static = ROOT / "static"
     group_settings = GroupSettings(feishu_settings_path, feishu_inbox_path, store, feishu_supervisor) if feishu_settings_path and feishu_inbox_path else None
+    onboarding = AssistantOnboarding(group_settings) if group_settings else None
+    manager = AssistantManager(onboarding) if onboarding else None
+    collaboration = AssistantCollaboration(onboarding,base_url) if onboarding else None
+    if collaboration and engine and allowed_host is None:engine.collaboration=collaboration
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             LOG.info("http %s", args[1] if len(args) > 1 else "?")
@@ -716,17 +782,51 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403, "origin_forbidden", "来源无效")
                 if self.command == "GET" and path in ("/", "/panel"):
                     return self.serve_file(static / "index.html", "text/html; charset=utf-8")
-                if self.command == "GET" and path in ("/static/style.css", "/static/app.js", "/static/feishu-groups.js"):
+                if self.command == "GET" and path in ("/static/style.css", "/static/app.js", "/static/feishu-groups.js", "/static/assistants.js"):
                     mime = "text/css; charset=utf-8" if path.endswith("css") else "application/javascript; charset=utf-8"
                     return self.serve_file(static / path.split("/")[-1], mime)
                 if path == "/healthz" and self.command == "GET":
                     return self.send_json(200, {"status": "ok"})
+                if path == '/api/bridge-instance' and self.command == 'GET':
+                    if allowed_host is not None or self.client_address[0] not in ('127.0.0.1','::1'):
+                        raise BridgeError(403,'local_only','安装信息只能在本机查看')
+                    from bridge_setup import VERSION
+                    return self.send_json(200,{'product':'codex-bridge','version':VERSION,
+                        'source_root':str(ROOT.resolve()),'state_dir':str(Path(store.db_path).resolve().parent)})
                 if path.startswith("/api/feishu") and self.command in ("GET", "PATCH", "POST"):
                     if allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1"):
                         raise BridgeError(403, "local_only", "飞书设置只能在本机修改")
                     if feishu_settings_path is None:
                         raise BridgeError(503, "feishu_unavailable", "飞书设置未启用")
-                    if path in ('/api/feishu/catalog','/api/feishu/apps','/api/feishu/groups','/api/feishu/app-pairing'):
+                    if path=='/api/feishu/collaboration-policy' and self.command in ('GET','POST'):
+                        if not collaboration:raise BridgeError(503,'feishu_unavailable','助手协作暂不可用')
+                        return self.send_json(200,collaboration.policy() if self.command=='GET' else collaboration.configure_policy(self.read_json()))
+                    if path=='/api/feishu/manager' and self.command=='POST':
+                        if not onboarding:raise BridgeError(503,'feishu_unavailable','创建助手暂不可用')
+                        if self.read_json()!={}:raise BridgeError(400,'invalid_request','请求内容无效')
+                        return self.send_json(200,onboarding.bootstrap_manager())
+                    if path=='/api/feishu/dispatcher' and self.command=='POST':
+                        if not onboarding:raise BridgeError(503,'feishu_unavailable','创建助手暂不可用')
+                        if self.read_json()!={}:raise BridgeError(400,'invalid_request','请求内容无效')
+                        return self.send_json(200,onboarding.bootstrap_dispatcher())
+                    if path.startswith('/api/feishu/collaboration/'):
+                        if not collaboration:raise BridgeError(503,'feishu_unavailable','协作功能暂不可用')
+                        ident=path.rsplit('/',1)[-1]
+                        if self.command=='GET':return self.send_json(200,collaboration.settings(ident))
+                        if self.command=='POST':return self.send_json(200,collaboration.configure(ident,self.read_json()))
+                        raise BridgeError(405,'method_not_allowed','操作不支持')
+                    if path == '/api/feishu/onboarding' or path.startswith('/api/feishu/onboarding/'):
+                        if not onboarding: raise BridgeError(503,'feishu_unavailable','创建助手暂不可用')
+                        if path.endswith('/qr') and self.command == 'GET':
+                            ident = path.split('/')[-2]
+                            job = onboarding.read(ident)
+                            image = onboarding.directory(ident) / 'qr.png'
+                            if job['phase'] != 'waiting_scan' or not image.exists():
+                                raise BridgeError(404,'qr_not_ready','二维码正在准备或已经失效')
+                            return self.serve_file(image, 'image/png')
+                        data = self.read_json() if self.command == 'POST' else None
+                        return self.send_json(200, onboarding.dispatch(path,self.command,data))
+                    if path in ('/api/feishu/catalog','/api/feishu/apps','/api/feishu/groups','/api/feishu/groups/remove','/api/feishu/app-pairing','/api/feishu/group-defaults'):
                         if not group_settings: raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
                         data = self.read_json(limit=128*1024) if self.command == 'POST' else None
                         return self.send_json(200, group_settings.dispatch(path,self.command,data))
@@ -793,6 +893,25 @@ def make_handler(store, engine, base_url, allowed_host=None,
                     return self.send_json(200, result)
                 if path == "/api/projects" and self.command == "GET":
                     return self.send_json(200, store.projects())
+                if path == "/api/projects/pick" and self.command == "POST":
+                    # Native macOS folder picker; only the panel itself may trigger it.
+                    if self.headers.get("Origin") != base_url or self.read_json() != {}:
+                        raise BridgeError(403, "origin_forbidden", "请从面板选择文件夹")
+                    start = claude_runtime.workspace_root() or Path.home()
+                    # A background agent cannot show UI itself; System Events hosts the dialog.
+                    script = ['-e', 'tell application "System Events"', '-e', 'activate',
+                              '-e', ('set picked to choose folder with prompt "选择这个助手执行任务的工作目录" '
+                                     f'default location (POSIX file {json.dumps(str(start), ensure_ascii=False)})'),
+                              '-e', 'end tell', '-e', 'POSIX path of picked']
+                    picked = subprocess.run(["osascript", *script], capture_output=True, text=True, timeout=600)
+                    if picked.returncode != 0:
+                        if "-128" in picked.stderr:
+                            return self.send_json(200, {"cancelled": True})
+                        LOG.warning("folder picker failed: %s", picked.stderr.strip()[:300])
+                        raise BridgeError(500, "folder_picker_failed",
+                                          "无法打开文件夹选择窗口：" + (picked.stderr.strip()[:200] or "未知错误"))
+                    project = store.add_project(picked.stdout.strip())
+                    return self.send_json(200, {"project": project, "projects": store.projects()})
                 if path.startswith("/api/projects/") and self.command == "PATCH":
                     data = self.read_json()
                     if not isinstance(data, dict) or set(data) != {"path"}:
@@ -827,6 +946,34 @@ def make_handler(store, engine, base_url, allowed_host=None,
                     if not isinstance(data, dict) or set(data) != {"decision"}:
                         raise BridgeError(400, "invalid_request", "无效字段")
                     return self.send_json(200, engine.resolve_approval(path.rsplit("/", 1)[-1], data["decision"]))
+                if path.startswith('/v1/group-topics'):
+                    if not collaboration or allowed_host is not None or self.client_address[0] not in ('127.0.0.1','::1'):
+                        raise BridgeError(403,'local_only','群话题只允许本机接收器')
+                    if self.headers.get('Origin') and self.headers['Origin']!=base_url:raise BridgeError(403,'origin_forbidden','来源无效')
+                    connection=store.authenticate(self.headers.get('Authorization',''))
+                    if path=='/v1/group-topics/resolve' and self.command=='POST':return self.send_json(200,collaboration.topics.resolve(connection['id'],self.read_json()))
+                    if path=='/v1/group-topics/alias' and self.command=='POST':return self.send_json(200,collaboration.topics.alias(connection['id'],self.read_json()))
+                    if path=='/v1/group-topics/submit' and self.command=='POST':
+                        data=self.read_json()
+                        with engine.lock:status,result=collaboration.topics.submit(connection,data)
+                        return self.send_json(status,result)
+                    if self.command=='GET':return self.send_json(200,collaboration.topics.get(connection['id'],path.rsplit('/',1)[-1]))
+                    raise BridgeError(405,'method_not_allowed','操作不支持')
+                if path in ('/v1/assistant-peers','/v1/assistant-calls','/v1/assistant-discussions','/v1/assistant-questions','/v1/assistant-answers') or path.startswith(('/v1/assistant-calls/','/v1/assistant-questions/')):
+                    if not collaboration or allowed_host is not None or self.client_address[0] not in ('127.0.0.1','::1'):
+                        raise BridgeError(403,'local_only','协作调用只允许本机任务')
+                    origin=self.headers.get('Origin')
+                    if origin and origin!=base_url:raise BridgeError(403,'origin_forbidden','来源无效')
+                    session=collaboration.authenticate(self.headers.get('Authorization',''))
+                    if path=='/v1/assistant-discussions' and self.command=='POST':return self.send_json(202,collaboration.topics.say(session,self.read_json()))
+                    if path=='/v1/assistant-questions' and self.command=='POST':return self.send_json(202,collaboration.topics.ask(session,self.read_json()))
+                    if path=='/v1/assistant-questions' and self.command=='GET':return self.send_json(200,{'questions':collaboration.topics.questions(session)})
+                    if path.startswith('/v1/assistant-questions/') and self.command=='GET':return self.send_json(200,collaboration.topics.question(session,path.rsplit('/',1)[-1]))
+                    if path=='/v1/assistant-answers' and self.command=='POST':return self.send_json(200,collaboration.topics.answer(session,self.read_json()))
+                    if path=='/v1/assistant-peers' and self.command=='GET':return self.send_json(200,{'assistants':collaboration.peers_for(session['assistant_id'],session['task_id'])})
+                    if path=='/v1/assistant-calls' and self.command=='POST':return self.send_json(202,collaboration.call(session,self.read_json(limit=64*1024)))
+                    if path.startswith('/v1/assistant-calls/') and self.command=='GET':return self.send_json(200,collaboration.result(session,path.rsplit('/',1)[-1]))
+                    raise BridgeError(405,'method_not_allowed','操作不支持')
                 if path == "/v1/tasks" and self.command == "POST":
                     connection = store.authenticate(self.headers.get("Authorization", ""))
                     data = self.read_json()
@@ -847,6 +994,9 @@ def make_handler(store, engine, base_url, allowed_host=None,
         do_GET = route
         do_POST = route
         do_PATCH = route
+    Handler.onboarding = onboarding
+    Handler.assistant_manager = manager
+    Handler.collaboration = collaboration
     return Handler
 
 
@@ -859,9 +1009,14 @@ def main():
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     raise_nofile_limit()
     store = Store(args.db, args.projects)
-    engine = Engine(store, LocalCodexTransport(AppServerClient(os.getenv("CODEX_BIN", "codex"))),
+    if claude_runtime.backend() == "claude":
+        transport = claude_runtime.ClaudeTransport(Path(args.db).parent)
+        LOG.info("execution backend: Claude Code (%s, permission_mode=%s, workspace_root=%s)",
+                 transport.claude_bin, transport.permission_mode, claude_runtime.workspace_root())
+    else:
+        transport = LocalCodexTransport(AppServerClient(os.getenv("CODEX_BIN", "codex")))
+    engine = Engine(store, transport,
                     history_inbox_path=Path(args.db).parent / 'feishu-inbox.sqlite3')
-    engine.start()
     base_url = f"http://127.0.0.1:{args.port}"
     feishu_settings_path = Path(os.getenv("FEISHU_CONFIG", str(Path(args.db).parent / "feishu.json")))
     supervisor = MultiFeishuSupervisor(
@@ -874,10 +1029,23 @@ def main():
                      feishu_supervisor=supervisor,
                      feishu_inbox_path=Path(args.db).parent / "feishu-inbox.sqlite3"))
     LOG.info("panel at %s", base_url)
+    engine.start()
+    if server.RequestHandlerClass.collaboration:
+        server.RequestHandlerClass.collaboration.authorizations.start()
+        server.RequestHandlerClass.collaboration.topics.start()
+    if server.RequestHandlerClass.assistant_manager:
+        server.RequestHandlerClass.assistant_manager.start()
     try:
         server.serve_forever()
     finally:
         server.server_close()
+        if server.RequestHandlerClass.collaboration:
+            server.RequestHandlerClass.collaboration.topics.close()
+            server.RequestHandlerClass.collaboration.authorizations.close()
+        if server.RequestHandlerClass.assistant_manager:
+            server.RequestHandlerClass.assistant_manager.close()
+        if server.RequestHandlerClass.onboarding:
+            server.RequestHandlerClass.onboarding.stop.set()
         supervisor.close()
         engine.close()
 

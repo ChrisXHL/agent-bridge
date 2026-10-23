@@ -16,6 +16,10 @@ backups/
 artifacts/
 .supervision*/
 .DS_Store
+node_modules/
+.tools/
+dist/
+attachments/
 # Additional application credentials and local authentication files
 feishu-apps/
 .envrc

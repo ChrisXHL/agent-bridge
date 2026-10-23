@@ -33,18 +33,18 @@ def validate_prompt_template(template):
     return template
 
 
-def render_prompt(template, message, source=None):
+def render_prompt(template, message, source=None, limit=True):
     result = validate_prompt_template(template).replace(MESSAGE_VARIABLE, message.strip())
     if source:
         fields = ('source_message_id', 'chat_id', 'app_id', 'parent_id', 'root_id')
         context = {key: source.get(key) for key in fields if source.get(key)}
-        result += ('\n\n[Codex Bridge 来源信息；由接收器提供，供附件交付定位]\n'
+        result += ('\n\n[Agent Bridge 来源信息；由接收器提供，供附件交付定位]\n'
                    + json.dumps(context, ensure_ascii=False, sort_keys=True))
     # Match the Bridge intake body's 16 KiB limit, including JSON escaping and a follow-up task ID.
     body = json.dumps({
         "message": result, "request_id": "fs_" + "x" * 48, "task_id": "x" * 100,
     }, ensure_ascii=False).encode("utf-8")
-    if not 1 <= len(result.strip()) <= 12000 or len(body) > 16 * 1024:
+    if not result.strip() or (limit and (len(result.strip()) > 12000 or len(body) > 16 * 1024)):
         raise BridgeError(400, "invalid_message", "模板与飞书消息合成后超过 Bridge 长度限制")
     return result
 
