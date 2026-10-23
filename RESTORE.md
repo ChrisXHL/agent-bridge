@@ -10,7 +10,7 @@
 建议把所需版本克隆到新目录，先查看源码和说明，再切换本机服务。
 
 ```sh
-git clone --branch v2.3-before-prompt https://github.com/ChrisXHL/codex-feishu-bridge.git bridge-restore
+git clone --branch v2.3-before-prompt https://github.com/ChrisXHL/agent-bridge.git bridge-restore
 cd bridge-restore
 python3.13 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt

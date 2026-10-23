@@ -1,4 +1,4 @@
-# Codex Feishu Bridge
+# Agent Bridge
 
 把飞书消息填入 Prompt，交给这台 Mac 上的 Codex 处理，并向原消息回复结果。
 
