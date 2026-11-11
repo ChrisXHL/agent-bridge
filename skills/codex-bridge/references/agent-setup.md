@@ -68,6 +68,22 @@ in that Feishu chat; Bridge handles their connections, workspaces and prompts.
 For the task coordinator use the existing dispatcher endpoint and ordinary
 groups. Do not create a topic-mode group. Do not import the distributor's state.
 
+## Link a bot that already exists in Feishu
+
+Use the panel's “接入已有机器人” or POST `/api/feishu/onboarding/existing`
+with an existing `app_id` and selected existing `project_id`. First GET the same
+endpoint to list locally saved Feishu app profiles; if the desired bot is absent,
+the user can provide its App ID. Poll the returned job ID. The owner scans the
+official QR locked to that App ID and confirms message permissions and events.
+Bridge creates a local connection to the selected project and a generic prompt;
+it does not create a Feishu app or a new Bridge assistant/project. Do not ask for
+App Secret in chat. An app already connected to Bridge keeps its original settings.
+A previously configured webhook or another
+running receiver may prevent reliable delivery: inspect the application's
+effective event mode and receiver before claiming success. Test a newly sent
+message and its reply after the connection reports ready. The manual form remains
+available when official QR selection cannot be used.
+
 ## Business operations without extra installed skills
 
 The new assistant's prompt includes its own CLI path and profile. Use that exact

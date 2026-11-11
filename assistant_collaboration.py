@@ -303,7 +303,8 @@ class AssistantCollaboration:
             if missing:self.authorizations.create(db,session,root,batch,list(dict.fromkeys(missing)))
             for j,cfg,conn,text in planned:
                 tid='task_'+uuid.uuid4().hex[:20];mid='msg_'+uuid.uuid4().hex[:20];at=time.time();prompt=self.child_prompt(j,cfg,text)
-                db.execute("INSERT INTO tasks VALUES (?,?,NULL,'等待 Codex',NULL,NULL,?,?)",(tid,conn['id'],at,at))
+                db.execute("INSERT INTO tasks (id,connection_id,thread_id,status,result,error_code,created_at,updated_at,execution_backend) VALUES (?,?,NULL,'等待 Codex',NULL,NULL,?,?,?)",
+                           (tid,conn['id'],at,at,conn.get('execution_backend','codex')))
                 db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?,NULL,?,?)",(mid,tid,conn['id'],batch+':'+mid,hashlib.sha256(prompt.encode()).hexdigest(),prompt,'authorization_pending' if missing else 'queued',at,at))
                 db.execute('INSERT INTO assistant_calls VALUES (?,?,?,?,?,?,?,?)',(tid,session['task_id'],batch,j['id'],j['name'],at,root,depth))
                 if missing:db.execute("UPDATE tasks SET result='等待创建者在飞书确认协作',error_code='assistant_authorization_required' WHERE id=?",(tid,))

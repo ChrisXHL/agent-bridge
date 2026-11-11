@@ -10,6 +10,7 @@ import logging
 import os
 import resource
 import secrets
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -33,7 +34,6 @@ from legacy_history import LegacyHistory
 from assistant_onboarding import AssistantOnboarding
 from assistant_manager import AssistantManager
 from assistant_collaboration import AssistantCollaboration, install as install_collaboration, CHILD_SLOTS
-import claude_runtime
 
 LOG = logging.getLogger("codex_bridge")
 ROOT = Path(__file__).resolve().parent
@@ -42,7 +42,7 @@ MAX_BODY = 16 * 1024
 CODEX_APPROVAL_POLICY = "never"
 CODEX_SANDBOX_MODE = "danger-full-access"
 CODEX_REASONING_EFFORT = "medium"
-MAX_ACTIVE_TASKS = int(os.getenv("BRIDGE_MAX_ACTIVE_TASKS", "5"))
+MAX_ACTIVE_TASKS = 10
 TARGET_NOFILE_LIMIT = 4096
 
 
@@ -52,6 +52,56 @@ def now():
 
 def digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def open_claude_task_conversation(store, task_id):
+    """Open a completed Bridge-owned Claude CLI session in Terminal."""
+    task = store.task(task_id)
+    if task.get("archived"):
+        raise BridgeError(409, "historical_task", "这条历史任务没有可打开的对话")
+    if task.get("execution_backend") != "claude":
+        raise BridgeError(400, "wrong_backend", "这个任务请直接在 Codex 打开")
+    thread_id = task.get("thread_id")
+    if not thread_id:
+        raise BridgeError(409, "conversation_not_ready", "任务还没有建立对话")
+    try:
+        thread_id = str(uuid.UUID(thread_id))
+    except (ValueError, TypeError) as exc:
+        raise BridgeError(409, "conversation_unavailable", "对话标识无效") from exc
+    if task["status"] in ("等待 Codex", "执行中"):
+        raise BridgeError(409, "conversation_busy", "Claude 正在执行，完成后再打开对话")
+    state_path = Path(store.db_path).parent / "claude-threads.sqlite3"
+    if not state_path.is_file():
+        raise BridgeError(404, "conversation_unavailable", "这条任务的 Claude 会话记录不存在")
+    with sqlite3.connect(state_path, timeout=5) as db:
+        row = db.execute("SELECT cwd,session_started FROM threads WHERE id=?", (thread_id,)).fetchone()
+        busy = db.execute("SELECT 1 FROM turns WHERE thread_id=? AND status='inProgress' LIMIT 1",
+                          (thread_id,)).fetchone()
+    if not row or not row[1]:
+        raise BridgeError(409, "conversation_not_ready", "Claude 对话尚未创建成功")
+    if busy:
+        raise BridgeError(409, "conversation_busy", "Claude 正在执行，完成后再打开对话")
+    cwd = Path(row[0])
+    if not cwd.is_dir():
+        raise BridgeError(409, "project_unavailable", "工作文件夹暂时无法访问，不能打开 Claude 对话")
+    if sys.platform != "darwin":
+        raise BridgeError(501, "terminal_unavailable", "当前系统不支持从面板打开 Claude 终端对话")
+    from claude_runtime import resolve_claude_binary
+    try:
+        claude_bin = resolve_claude_binary(None)
+    except Exception as exc:
+        raise BridgeError(503, "claude_unavailable", "本机找不到 Claude Code CLI") from exc
+    command = f"cd {shlex.quote(str(cwd))} && {shlex.quote(str(claude_bin))} --resume {shlex.quote(thread_id)}"
+    script = ["-e", 'tell application "Terminal"', "-e", f"do script {json.dumps(command, ensure_ascii=False)}",
+              "-e", "activate", "-e", "end tell"]
+    try:
+        opened = subprocess.run(["osascript", *script], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BridgeError(503, "terminal_unavailable", "无法打开终端，请检查 Terminal 是否可用") from exc
+    if opened.returncode:
+        LOG.warning("Could not open Claude conversation in Terminal: %s", opened.stderr.strip()[:300])
+        raise BridgeError(503, "terminal_unavailable", "无法打开终端，请检查 Terminal 是否可用")
+    return {"opened": True}
 
 
 def raise_nofile_limit(target=TARGET_NOFILE_LIMIT):
@@ -70,7 +120,7 @@ def raise_nofile_limit(target=TARGET_NOFILE_LIMIT):
 class LocalCodexTransport:
     """Reuses the verified HTTP Bridge App Server client and readback rule."""
     def __init__(self, client=None, verify_seconds=90):
-        self.client = client or AppServerClient()
+        self.client = client or AppServerClient(experimental_api=True)
         self.verify_seconds = verify_seconds
 
     def start_thread(self, cwd):
@@ -84,19 +134,30 @@ class LocalCodexTransport:
         return thread_id
 
     def send(self, thread_id, message):
+        return self.send_with_receipt(thread_id, message)
+
+    def send_with_receipt(self, thread_id, message, receipt_id=None, on_accepted=None):
         response = self.client.request("turn/start", {
             "threadId": thread_id, "input": [{"type": "text", "text": message}],
+            **({"clientUserMessageId": str(uuid.uuid5(uuid.NAMESPACE_URL, receipt_id))} if receipt_id else {}),
             "approvalPolicy": CODEX_APPROVAL_POLICY,
             "sandboxPolicy": {"type": "dangerFullAccess"},
             "effort": CODEX_REASONING_EFFORT,
         })
         turn_id = response.get("turn", {}).get("id")
+        if not turn_id:
+            raise BridgeError(503,"delivery_uncertain","Codex did not return a turn identifier")
+        if turn_id and on_accepted:
+            # Save acceptance before readback: a restart during verification
+            # must not lose the only identifier that can disambiguate the turn.
+            on_accepted(turn_id)
         deadline = time.monotonic() + self.verify_seconds
         logged = False
         while True:
             try:
                 thread = self.read(thread_id)
-                if Bridge._message_seen(thread, message):
+                turns = [t for t in thread.get("turns", []) if not turn_id or t.get("id") == turn_id]
+                if Bridge._message_seen({"turns": turns}, message):
                     return turn_id
                 if not logged:
                     LOG.info("awaiting Codex readback thread=%s turns=%s status=%s", thread_id,
@@ -107,7 +168,8 @@ class LocalCodexTransport:
                     LOG.info("Codex readback pending thread=%s reason=%s", thread_id, type(exc).__name__)
                     logged = True
             if time.monotonic() >= deadline:
-                raise RuntimeError("Codex accepted the message but readback is uncertain")
+                raise BridgeError(503, "delivery_uncertain", "Codex accepted the turn; message readback is pending",
+                                  extra={"turn_id": turn_id})
             time.sleep(0.4)
 
     def read(self, thread_id):
@@ -119,6 +181,28 @@ class LocalCodexTransport:
             "approvalPolicy": CODEX_APPROVAL_POLICY,
             "sandbox": CODEX_SANDBOX_MODE,
         })
+
+    def queued_receipt(self, thread_id, receipt_id):
+        client_id = str(uuid.uuid5(uuid.NAMESPACE_URL,receipt_id))
+        cursor = None
+        while True:
+            params = {'threadId':thread_id,'limit':100}
+            if cursor:params['cursor']=cursor
+            page = self.client.request('thread/queue/list',params)
+            for item in page.get('data',[]):
+                if item.get('clientUserMessageId') == client_id:return item
+            cursor = page.get('nextCursor')
+            if not cursor:return None
+
+    def enqueue_desktop(self, thread_id, message, receipt_id):
+        existing = self.queued_receipt(thread_id,receipt_id)
+        expected = [{'type':'text','text':message}]
+        if existing:
+            if existing.get('input') != expected:
+                raise BridgeError(409,'queue_payload_changed','Queued request differs from the saved request')
+            return existing
+        return self.client.request('thread/queue/add',{'threadId':thread_id,'input':expected,
+            'clientUserMessageId':str(uuid.uuid5(uuid.NAMESPACE_URL,receipt_id))})['queuedSubmission']
 
     def release_idle(self):
         # A loaded app-server thread holds the writer lock, preventing CLI resume.
@@ -132,6 +216,7 @@ class Store:
     def __init__(self, db_path, projects_path, codex_state_path=None):
         self.db_path = str(db_path)
         self.projects_path = Path(projects_path)
+        self._projects_lock = threading.RLock()
         self.codex_state_path = Path(codex_state_path) if codex_state_path else None
         self._project_discovery_warning_at = 0.0
         self.history = LegacyHistory(Path(db_path).parent / "feishu-inbox.sqlite3")
@@ -177,10 +262,24 @@ class Store:
               id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
               method TEXT NOT NULL, detail TEXT NOT NULL, state TEXT NOT NULL,
               created_at REAL NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS delivery_payloads (
+              message_id TEXT PRIMARY KEY REFERENCES messages(id), content TEXT NOT NULL);
             """)
+            db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('desktop_queue_after',?)",(str(now()),))
+            if 'execution_backend' not in {r[1] for r in db.execute('PRAGMA table_info(connections)')}:
+                db.execute("ALTER TABLE connections ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'codex'")
+            connection_columns = {r[1] for r in db.execute('PRAGMA table_info(connections)')}
+            if 'deleted_at' not in connection_columns:
+                db.execute('ALTER TABLE connections ADD COLUMN deleted_at REAL')
+            if 'status_before_delete' not in connection_columns:
+                db.execute('ALTER TABLE connections ADD COLUMN status_before_delete TEXT')
+            if 'execution_backend' not in {r[1] for r in db.execute('PRAGMA table_info(tasks)')}:
+                db.execute("ALTER TABLE tasks ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'codex'")
             # An interrupted send cannot be replayed safely without a Codex readback.
             db.execute("UPDATE messages SET delivery='uncertain' WHERE delivery='sending'")
-            db.execute("UPDATE tasks SET status='需要你处理', error_code='delivery_uncertain' WHERE id IN (SELECT task_id FROM messages WHERE delivery='uncertain')")
+            db.execute("""UPDATE tasks SET status='需要你处理', error_code='delivery_uncertain'
+                WHERE status NOT IN ('已完成','失败','已停止')
+                AND id IN (SELECT task_id FROM messages WHERE delivery='uncertain')""")
             db.execute("UPDATE approvals SET state='unavailable' WHERE state='pending'")
             db.execute("""UPDATE tasks SET status='需要你处理',
                 result='Codex 审批连接已中断，请在 Codex 中查看任务并重新发起需要审批的操作。',
@@ -268,24 +367,37 @@ class Store:
         temp.replace(self.projects_path)
         return self.project(project_id)
 
-    def add_project(self, path):
-        """Register a folder the user picked; reuse the existing entry for the same folder."""
-        if not isinstance(path, str) or not Path(path).is_absolute() or not Path(path).is_dir():
-            raise BridgeError(400, "invalid_project_path", "请选择现有的文件夹")
-        resolved = str(Path(path).resolve(strict=True))
-        for item in self.projects():
+    def register_project_path(self, path):
+        if not isinstance(path, str) or not path.strip() or len(path) > 4096:
+            raise BridgeError(400, "invalid_project_path", "请填写本机已有文件夹的完整路径")
+        folder = Path(path.strip()).expanduser()
+        if not folder.is_absolute() or not folder.is_dir():
+            raise BridgeError(400, "invalid_project_path", "请选择本机已有文件夹，填写完整路径")
+        try:
+            resolved = folder.resolve(strict=True)
+        except OSError as exc:
+            raise BridgeError(400, "invalid_project_path", "这个文件夹暂时无法访问") from exc
+        if not os.access(resolved, os.R_OK | os.X_OK):
+            raise BridgeError(400, "invalid_project_path", "Bridge 无法读取这个文件夹")
+        with self._projects_lock:
+            for project in self.projects():
+                try:
+                    if Path(project["path"]).resolve() == resolved:
+                        return project
+                except OSError:
+                    continue
+            raw = json.loads(self.projects_path.read_text(encoding="utf-8")) if self.projects_path.exists() else {}
+            project_id = "folder_" + uuid.uuid4().hex[:16]
+            raw[project_id] = str(resolved)
+            self.projects_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.projects_path.with_name(self.projects_path.name + "." + uuid.uuid4().hex + ".tmp")
             try:
-                if str(Path(item["path"]).resolve()) == resolved:
-                    return item
-            except OSError:
-                continue
-        raw = json.loads(self.projects_path.read_text(encoding="utf-8")) if self.projects_path.exists() else {}
-        project_id = "local-" + digest(resolved)[:12]
-        raw[project_id] = resolved
-        temp = self.projects_path.with_suffix(".tmp")
-        temp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temp.replace(self.projects_path)
-        return self.project(project_id)
+                temp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                temp.chmod(0o600)
+                temp.replace(self.projects_path)
+            finally:
+                temp.unlink(missing_ok=True)
+            return self.project(project_id)
 
     def create_connection(self, source, project_id):
         if not isinstance(source, str) or not 1 <= len(source.strip()) <= 60:
@@ -295,7 +407,7 @@ class Store:
         key = "cb_" + secrets.token_urlsafe(36)
         t = now()
         with self.db() as db:
-            db.execute("INSERT INTO connections VALUES (?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO connections (id,source,project_id,api_key,api_key_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
                        (cid, source.strip(), project_id, key, digest(key), "待验证", t, t))
         return self.connection(cid, reveal=True)
 
@@ -311,10 +423,39 @@ class Store:
             obj.pop("api_key", None)
         return obj
 
-    def connections(self):
+    def connections(self, deleted=False):
         with self.db() as db:
-            ids = [r["id"] for r in db.execute("SELECT id FROM connections ORDER BY created_at DESC")]
+            where = 'IS NOT NULL' if deleted else 'IS NULL'
+            ids = [r["id"] for r in db.execute(f"SELECT id FROM connections WHERE deleted_at {where} ORDER BY created_at DESC")]
         return [self.connection(cid) for cid in ids]
+
+    def remove_connection(self, cid):
+        archived = set(self.history.tasks())
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            connection = db.execute('SELECT status,deleted_at FROM connections WHERE id=?', (cid,)).fetchone()
+            if not connection:
+                raise BridgeError(404, 'connection_not_found', '连接不存在')
+            if connection['deleted_at'] is not None:
+                raise BridgeError(409, 'connection_deleted', '这个连接已删除')
+            active = [row['id'] for row in db.execute(
+                "SELECT id FROM tasks WHERE connection_id=? AND status NOT IN ('已完成','失败','已停止')", (cid,))]
+            if any(task_id not in archived for task_id in active):
+                raise BridgeError(409, 'connection_busy', '这个连接还有未结束的任务，完成后才能删除')
+            db.execute("UPDATE connections SET status='已停用',status_before_delete=?,deleted_at=?,updated_at=? WHERE id=?",
+                       (connection['status'], now(), now(), cid))
+        return self.connection(cid)
+
+    def restore_connection(self, cid):
+        with self.db() as db:
+            connection = db.execute('SELECT deleted_at,status_before_delete FROM connections WHERE id=?', (cid,)).fetchone()
+            if not connection:
+                raise BridgeError(404, 'connection_not_found', '连接不存在')
+            if connection['deleted_at'] is None:
+                raise BridgeError(409, 'connection_not_deleted', '这个连接尚未删除')
+            db.execute('UPDATE connections SET status=?,status_before_delete=NULL,deleted_at=NULL,updated_at=? WHERE id=?',
+                       (connection['status_before_delete'] or '待验证', now(), cid))
+        return self.connection(cid)
 
     def authenticate(self, bearer):
         if not bearer.startswith("Bearer "):
@@ -324,7 +465,7 @@ class Store:
             row = db.execute("SELECT * FROM connections WHERE api_key_hash=?", (key_hash,)).fetchone()
         if not row or not hmac.compare_digest(row["api_key_hash"], key_hash):
             raise BridgeError(401, "unauthorized", "连接密钥无效")
-        if row["status"] == "已停用":
+        if row["status"] == "已停用" or row['deleted_at'] is not None:
             raise BridgeError(403, "connection_disabled", "连接已停用")
         return dict(row)
 
@@ -333,6 +474,8 @@ class Store:
         if status not in ("已停用", "待验证", "可用") or set(payload) != {"status"}:
             raise BridgeError(400, "invalid_status", "连接状态无效")
         with self.db() as db:
+            if db.execute('SELECT 1 FROM connections WHERE id=? AND deleted_at IS NOT NULL', (cid,)).fetchone():
+                raise BridgeError(409, 'connection_deleted', '连接已删除，请先恢复')
             if status == "待验证" and db.execute(
                 "SELECT 1 FROM messages WHERE connection_id=? AND delivery='delivered' LIMIT 1", (cid,)
             ).fetchone():
@@ -340,6 +483,15 @@ class Store:
             if db.execute("UPDATE connections SET status=?,updated_at=? WHERE id=?", (status, now(), cid)).rowcount == 0:
                 raise BridgeError(404, "connection_not_found", "连接不存在")
         return self.connection(cid)
+
+    def set_execution_backend(self, cids, backend):
+        if backend not in ('codex', 'claude'):
+            raise BridgeError(400, 'invalid_backend', '请选择 Codex CLI 或 Claude Code CLI')
+        with self.db() as db:
+            for cid in set(cids):
+                if db.execute('UPDATE connections SET execution_backend=?,updated_at=? WHERE id=?',
+                              (backend, now(), cid)).rowcount != 1:
+                    raise BridgeError(404, 'connection_not_found', '连接不存在')
 
     def submit(self, connection, payload, request_id):
         if not isinstance(payload, dict) or set(payload) - {"task_id", "message", "request_id", "continue_from"}:
@@ -365,6 +517,9 @@ class Store:
         cid = connection["id"]
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            current = db.execute('SELECT status,deleted_at FROM connections WHERE id=?', (cid,)).fetchone()
+            if not current or current['status'] == '已停用' or current['deleted_at'] is not None:
+                raise BridgeError(403, 'connection_disabled', '连接已停用')
             existing = db.execute("SELECT * FROM messages WHERE connection_id=? AND request_id=?", (cid, request_id)).fetchone()
             if existing:
                 if existing["fingerprint"] != fingerprint:
@@ -384,14 +539,15 @@ class Store:
                         raise BridgeError(404,'task_not_found','这个连接中没有该对话')
                     if previous['status'] not in ('已完成','失败','已停止'):
                         raise BridgeError(409,'conversation_busy','前一条消息尚未处理完成')
-                    thread_id = previous['thread_id']
+                    thread_id = previous['thread_id'] if previous['execution_backend'] == connection['execution_backend'] else None
                     if thread_id and db.execute("SELECT 1 FROM tasks WHERE thread_id=? AND status IN ('执行中','等待 Codex','需要你处理')",(thread_id,)).fetchone():
                         raise BridgeError(409,'conversation_busy','这个对话仍有消息在处理')
                 task_id = "task_" + uuid.uuid4().hex[:20]
                 t = now()
                 # Keep each delivery and collaboration budget separate. Only the
                 # Codex conversation is continued; completed records stay immutable.
-                db.execute("INSERT INTO tasks VALUES (?,?,?,'等待 Codex',NULL,NULL,?,?)", (task_id, cid, thread_id, t, t))
+                db.execute("INSERT INTO tasks (id,connection_id,thread_id,status,result,error_code,created_at,updated_at,execution_backend) VALUES (?,?,?,'等待 Codex',NULL,NULL,?,?,?)",
+                           (task_id, cid, thread_id, t, t, connection['execution_backend']))
             t = now()
             db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,'queued',NULL,?,?)",
                        ("msg_" + uuid.uuid4().hex[:20], task_id, cid, request_id, fingerprint, message.strip(), t, t))
@@ -463,11 +619,13 @@ class Store:
 
 
 class Engine:
-    def __init__(self, store, transport=None, interval=2, max_active=MAX_ACTIVE_TASKS, history_inbox_path=None):
+    def __init__(self, store, transport=None, interval=2, max_active=MAX_ACTIVE_TASKS, history_inbox_path=None, claude_transport=None):
         if max_active < 1:
             raise ValueError("max_active must be positive")
         self.store = store
         self.transport = transport or LocalCodexTransport()
+        self.claude_transport = claude_transport
+        self.claude_lock = threading.Lock()
         self.interval = interval
         self.max_active = max_active
         self.stop = threading.Event()
@@ -477,9 +635,19 @@ class Engine:
         self.worker = None
         self.history = LegacyHistory(history_inbox_path) if history_inbox_path else store.history
         self.archived_tasks = {}
+        self.recovery_cursor = 0
         self.collaboration = None
         if hasattr(self.transport, "client"):
             self.transport.client.on_server_request = self._on_server_request
+
+    def _transport_for(self, backend):
+        if backend != 'claude':
+            return self.transport
+        with self.claude_lock:
+            if self.claude_transport is None:
+                from claude_runtime import ClaudeTransport
+                self.claude_transport = ClaudeTransport(Path(self.store.db_path).parent)
+            return self.claude_transport
 
     def _on_server_request(self, request):
         method = request.get("method")
@@ -531,9 +699,9 @@ class Engine:
             return
         try:
             self.archived_tasks = self.history.tasks()
+            self._reconcile_uncertain()
             self._refresh()
-            if self._codex_desktop_open():
-                self._deliver_one()
+            self._deliver_one()
         finally:
             self.lock.release()
 
@@ -550,10 +718,74 @@ class Engine:
         except (OSError, subprocess.SubprocessError):
             return False
 
+    def request_recovery(self, task_id):
+        # The periodic reconciler does the I/O. The HTTP receiver must return
+        # promptly, and must never turn a generic assent into approval/replay.
+        task = self.store.task(task_id)
+        return {"task_id": task_id, "status": task["status"],
+                "recovery": "checking" if task.get("error_code") == "delivery_uncertain" else "not_required"}
+
+    def _reconcile_uncertain(self):
+        with self.store.db() as db:
+            rows = db.execute("""SELECT m.*,t.thread_id,t.execution_backend,
+                COALESCE(p.content,m.content) AS sent_content
+                FROM messages m JOIN tasks t ON t.id=m.task_id
+                LEFT JOIN delivery_payloads p ON p.message_id=m.id
+                WHERE ((m.delivery='uncertain' AND t.error_code='delivery_uncertain' AND t.status='需要你处理')
+                    OR (m.delivery='desktop_queued' AND t.error_code='codex_desktop_queued' AND t.status='等待 Codex'))
+                AND t.thread_id IS NOT NULL
+                ORDER BY m.created_at""").fetchall()
+        if rows:
+            index = self.recovery_cursor % len(rows)
+            self.recovery_cursor = (index + 1) % len(rows)
+            rows = [rows[index]]
+        for row in rows:
+            if row['task_id'] in self.archived_tasks:
+                continue
+            try:
+                thread = self._transport_for(row['execution_backend']).read(row['thread_id'])
+            except Exception:
+                continue
+            turns = thread.get('turns') or []
+            if row['turn_id']:
+                turns = [t for t in turns if t.get('id') == row['turn_id']]
+            else:
+                client_id = str(uuid.uuid5(uuid.NAMESPACE_URL,row['id']))
+                turns = [t for t in turns if any(i.get('type') == 'userMessage' and i.get('clientId') == client_id
+                                                for i in t.get('items',[]))]
+            matches = [t for t in turns if Bridge._message_seen({'turns':[t]},row['sent_content'])]
+            if len(matches) != 1:
+                # Missing/ambiguous history is not proof of non-delivery.
+                # No resend here: the original turn may already have side effects.
+                if row['delivery'] == 'uncertain':
+                    queued_receipt = getattr(self._transport_for(row['execution_backend']),'queued_receipt',None)
+                    if queued_receipt:
+                        try:
+                            queued = queued_receipt(row['thread_id'],row['id'])
+                            if queued and queued.get('input') == [{'type':'text','text':row['sent_content']}]:
+                                with self.store.db() as db:
+                                    db.execute("UPDATE messages SET delivery='desktop_queued',updated_at=? WHERE id=? AND delivery='uncertain'",(now(),row['id']))
+                                    db.execute("UPDATE tasks SET status='等待 Codex',error_code='codex_desktop_queued',result='消息已进入桌面会话队列，等待原会话接续。',updated_at=? WHERE id=? AND error_code='delivery_uncertain'",(now(),row['task_id']))
+                        except Exception:pass
+                continue
+            turn_id = matches[0].get('id') or row['turn_id']
+            if not turn_id:
+                continue
+            with self.store.db() as db:
+                current = db.execute('SELECT status,error_code FROM tasks WHERE id=?',(row['task_id'],)).fetchone()
+                if not current or tuple(current) not in (('需要你处理','delivery_uncertain'),('等待 Codex','codex_desktop_queued')):
+                    continue
+                db.execute("UPDATE messages SET delivery='delivered',turn_id=?,updated_at=? WHERE id=? AND delivery IN ('uncertain','desktop_queued')",
+                           (turn_id,now(),row['id']))
+                approval = db.execute("SELECT 1 FROM approvals WHERE task_id=? AND state='pending'",(row['task_id'],)).fetchone()
+                db.execute('UPDATE tasks SET status=?,error_code=?,result=NULL,updated_at=? WHERE id=?',
+                           ('需要你处理' if approval else '执行中','approval_required' if approval else None,now(),row['task_id']))
+            LOG.info('delivery reconciled task=%s turn=%s',row['task_id'],turn_id)
+
     def _refresh(self):
         with self.store.db() as db:
-            rows = db.execute("""SELECT id,thread_id,status FROM tasks WHERE thread_id IS NOT NULL
-                AND error_code IS NOT 'workflow_blocked' AND
+            rows = db.execute("""SELECT id,thread_id,status,execution_backend FROM tasks WHERE thread_id IS NOT NULL
+                AND error_code IS NOT 'workflow_blocked' AND error_code IS NOT 'delivery_uncertain' AND
                 (status IN ('执行中','需要你处理') OR
                  (status='等待 Codex' AND EXISTS (SELECT 1 FROM messages WHERE task_id=tasks.id AND delivery='superseded')
                   AND NOT EXISTS (SELECT 1 FROM messages WHERE task_id=tasks.id AND delivery IN ('queued','sending','uncertain'))))""").fetchall()
@@ -561,27 +793,30 @@ class Engine:
             if row["id"] in self.archived_tasks:
                 continue
             try:
-                thread = self.transport.read(row["thread_id"])
+                thread = self._transport_for(row["execution_backend"]).read(row["thread_id"])
             except Exception:
                 continue
             turns = thread.get("turns") or []
             if not turns:
                 continue
-            last = turns[-1]
-            state = last.get("status")
             with self.store.db() as db:
                 expected = db.execute("""SELECT turn_id FROM messages WHERE task_id=?
                     AND delivery='delivered' ORDER BY created_at DESC LIMIT 1""", (row['id'],)).fetchone()
-            if expected and expected['turn_id'] and last.get('id') and last['id'] != expected['turn_id']:
-                # Disk readback may lag a newly started desktop turn. Never let
-                # the preceding completed turn finish the new stage.
-                continue
+            last = turns[-1]
+            if expected and expected['turn_id']:
+                matching = [t for t in turns if t.get('id') == expected['turn_id']]
+                if matching:
+                    last = matching[0]
+                elif last.get('id'):
+                    continue
+            state = last.get("status")
             if state == 'interrupted' and (thread.get('status') or {}).get('type') == 'notLoaded':
                 # Another app-server owns the live thread. Its partial persisted
                 # history is not authoritative evidence of an interruption.
                 continue
             items = last.get("items") or []
-            final = next((x.get("text") for x in reversed(items) if x.get("type") == "agentMessage" and x.get("text")), None)
+            final = next((x.get("text") for x in reversed(items) if x.get("type") == "agentMessage"
+                          and x.get('phase') != 'commentary' and x.get("text")), None)
             if state == "completed":
                 if self.collaboration and self.collaboration.topics.pause_for_question(row['id']):
                     continue
@@ -598,9 +833,10 @@ class Engine:
         with self.store.db() as db:
             active = any(r[0] not in self.archived_tasks for r in db.execute("SELECT id FROM tasks WHERE status IN ('执行中','需要你处理')"))
         if not active:
-            release = getattr(self.transport, "release_idle", None)
-            if release:
-                release()
+            for transport in (self.transport, self.claude_transport):
+                release = getattr(transport, "release_idle", None)
+                if release:
+                    release()
 
     def _deliver_one(self):
         with self.store.db() as db:
@@ -611,7 +847,7 @@ class Engine:
                 AND NOT (status='需要你处理' AND COALESCE(error_code,'') IN ('delivery_uncertain','assistant_authorization_required','group_question_pending')
                     AND NOT EXISTS (SELECT 1 FROM approvals WHERE task_id=tasks.id AND state='pending'))""").fetchall()
             active_by_depth={depth:sum(r['id'] not in self.archived_tasks and r['depth']==depth for r in active_rows) for depth in range(4)}
-            rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,c.project_id,
+            rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,t.execution_backend,c.project_id,
                 COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=t.id),0) AS depth
                 FROM messages m JOIN tasks t ON t.id=m.task_id JOIN connections c ON c.id=t.connection_id
                 WHERE m.delivery='queued' AND (c.status!='已停用' OR EXISTS(SELECT 1 FROM assistant_calls a WHERE a.child_task=t.id))
@@ -619,6 +855,8 @@ class Engine:
                 ORDER BY EXISTS(SELECT 1 FROM assistant_resume_messages r WHERE r.message_id=m.id) DESC,m.created_at""").fetchall()
         for row in rows:
             if row['task_id'] in self.archived_tasks:
+                continue
+            if row['execution_backend'] == 'codex' and not self._codex_desktop_open():
                 continue
             if self.collaboration and not self.collaboration.may_deliver(dict(row)):continue
             if active_by_depth.get(row['depth'],0)>=(CHILD_SLOTS if row['depth'] else self.max_active):continue
@@ -628,6 +866,7 @@ class Engine:
     def _deliver_message(self, msg):
         if msg["thread_id"] and msg["task_status"] in ("执行中", "需要你处理"):
             return False
+        transport = self._transport_for(msg.get("execution_backend", "codex"))
         try:
             project = self.store.project(msg["project_id"])
             cwd = str(Path(project["path"]).resolve(strict=True))
@@ -642,14 +881,19 @@ class Engine:
             return False
         if msg["thread_id"]:
             try:
-                turns = self.transport.read(msg["thread_id"]).get("turns") or []
+                thread = transport.read(msg["thread_id"])
+                turns = thread.get("turns") or []
                 if turns and turns[-1].get("status") in ("inProgress", "in_progress"):
+                    if (thread.get('status') or {}).get('type') == 'notLoaded' and self._enqueue_desktop(msg,transport):
+                        return True
                     return False
-                resume = getattr(self.transport, "resume_thread", None)
+                resume = getattr(transport, "resume_thread", None)
                 if resume:
                     resume(msg["thread_id"])
             except Exception as exc:
                 code = 'codex_thread_owned' if 'active writer' in str(exc) else 'codex_resume_unavailable'
+                if code == 'codex_thread_owned' and self._enqueue_desktop(msg,transport):
+                    return True
                 detail = ('原 Codex 任务正由桌面端持有，Bridge 暂时无法续接；请由当前 Codex 任务接续队列。'
                           if code == 'codex_thread_owned' else '暂时无法恢复原 Codex 任务，Bridge 正在重试。')
                 with self.store.db() as db:
@@ -665,11 +909,17 @@ class Engine:
                     return False
             thread_id = msg["thread_id"]
             if not thread_id:
-                thread_id = self.transport.start_thread(cwd)
+                thread_id = transport.start_thread(cwd)
                 with self.store.db() as db:
                     db.execute("UPDATE tasks SET thread_id=?,updated_at=? WHERE id=?", (thread_id, now(), msg["task_id"]))
-            content=self.collaboration.prepare(msg) if self.collaboration else msg['content']
-            turn_id = self.transport.send(thread_id, content)
+            content=self._saved_payload(msg)
+            def accepted(turn_id):
+                with self.store.db() as db:
+                    db.execute("UPDATE messages SET turn_id=?,updated_at=? WHERE id=? AND delivery='sending'",
+                               (turn_id,now(),msg['id']))
+            send_with_receipt = getattr(transport,'send_with_receipt',None)
+            turn_id = (send_with_receipt(thread_id,content,msg['id'],accepted) if send_with_receipt
+                       else transport.send(thread_id,content))
             with self.store.db() as db:
                 db.execute("UPDATE messages SET delivery='delivered',turn_id=?,updated_at=? WHERE id=?", (turn_id, now(), msg["id"]))
                 db.execute("""UPDATE tasks SET
@@ -690,6 +940,34 @@ class Engine:
             self._delivery_error(msg, "delivery_uncertain", str(exc), uncertain=True)
         return True
 
+    def _saved_payload(self,msg):
+        with self.store.db() as db:
+            row=db.execute('SELECT content FROM delivery_payloads WHERE message_id=?',(msg['id'],)).fetchone()
+        if row:return row[0]
+        content=self.collaboration.prepare(msg) if self.collaboration else msg['content']
+        with self.store.db() as db:
+            db.execute('INSERT OR IGNORE INTO delivery_payloads VALUES (?,?)',(msg['id'],content))
+            return db.execute('SELECT content FROM delivery_payloads WHERE message_id=?',(msg['id'],)).fetchone()[0]
+
+    def _enqueue_desktop(self,msg,transport):
+        enqueue=getattr(transport,'enqueue_desktop',None)
+        if not enqueue:return False
+        with self.store.db() as db:
+            after=db.execute("SELECT value FROM settings WHERE key='desktop_queue_after'").fetchone()
+            allow=db.execute("SELECT value FROM settings WHERE key='desktop_queue_recovery_messages'").fetchone()
+            permitted=msg['created_at'] >= float(after[0]) if after else False
+            if not permitted and msg['id'] not in (json.loads(allow[0]) if allow else []):return False
+            if not db.execute("UPDATE messages SET delivery='sending',updated_at=? WHERE id=? AND delivery='queued'",(now(),msg['id'])).rowcount:return False
+        try:
+            content=self._saved_payload(msg)
+            enqueue(msg['thread_id'],content,msg['id'])
+            with self.store.db() as db:
+                db.execute("UPDATE messages SET delivery='desktop_queued',updated_at=? WHERE id=? AND delivery='sending'",(now(),msg['id']))
+                db.execute("UPDATE tasks SET status='等待 Codex',error_code='codex_desktop_queued',result='消息已进入桌面会话队列，等待原会话接续。',updated_at=? WHERE id=?",(now(),msg['task_id']))
+        except Exception:
+            self._delivery_error(msg,'delivery_uncertain','Desktop queue acknowledgement is unverified',True)
+        return True
+
     def _wait_for_project(self, msg, exc):
         message = "项目暂时无法访问，Bridge 正在重试；如果目录已移动，请在连接设置中重新选择项目。"
         with self.store.db() as db:
@@ -708,7 +986,7 @@ class Engine:
         if code == "project_unavailable":
             self.store.set_task(msg["task_id"], "失败", "项目位置发生变化，请重新选择项目。", code)
         elif uncertain:
-            self.store.set_task(msg["task_id"], "需要你处理", "交付结果未能确认，请到 Codex 查看该任务。", code)
+            self.store.set_task(msg["task_id"], "需要你处理", "消息交接尚未核实，系统正在检查原任务；无需重复确认，也不会重复执行。", "delivery_uncertain")
         else:
             self.store.set_task(msg["task_id"], "失败", detail, code)
 
@@ -717,6 +995,8 @@ class Engine:
         if self.worker:
             self.worker.join(timeout=2)
         self.transport.close()
+        if self.claude_transport:
+            self.claude_transport.close()
 
 
 def make_handler(store, engine, base_url, allowed_host=None,
@@ -798,6 +1078,14 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403, "local_only", "飞书设置只能在本机修改")
                     if feishu_settings_path is None:
                         raise BridgeError(503, "feishu_unavailable", "飞书设置未启用")
+                    if path == '/api/feishu/assistant-self-update' and self.command == 'POST':
+                        if not group_settings:raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
+                        from assistant_self_update import update as update_assistant_self
+                        return self.send_json(200,update_assistant_self(group_settings,self.read_json()))
+                    if path == '/api/feishu/assistant-schedules' and self.command == 'POST':
+                        if not group_settings:raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
+                        from assistant_schedules import manage as manage_assistant_schedules
+                        return self.send_json(200,manage_assistant_schedules(group_settings,self.read_json()))
                     if path=='/api/feishu/collaboration-policy' and self.command in ('GET','POST'):
                         if not collaboration:raise BridgeError(503,'feishu_unavailable','助手协作暂不可用')
                         return self.send_json(200,collaboration.policy() if self.command=='GET' else collaboration.configure_policy(self.read_json()))
@@ -826,9 +1114,9 @@ def make_handler(store, engine, base_url, allowed_host=None,
                             return self.serve_file(image, 'image/png')
                         data = self.read_json() if self.command == 'POST' else None
                         return self.send_json(200, onboarding.dispatch(path,self.command,data))
-                    if path in ('/api/feishu/catalog','/api/feishu/apps','/api/feishu/groups','/api/feishu/groups/remove','/api/feishu/app-pairing','/api/feishu/group-defaults'):
+                    if path in ('/api/feishu/catalog','/api/feishu/accounts','/api/feishu/accounts/remove','/api/feishu/accounts/restore','/api/feishu/apps','/api/feishu/apps/backend','/api/feishu/apps/enabled','/api/feishu/groups','/api/feishu/app-pairing','/api/feishu/group-defaults','/api/feishu/migration/export','/api/feishu/migration/import','/api/feishu/migration/stop','/api/feishu/assistant-template/export','/api/feishu/assistant-template/apply'):
                         if not group_settings: raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
-                        data = self.read_json(limit=128*1024) if self.command == 'POST' else None
+                        data = self.read_json(limit=1024*1024 if path.startswith(('/api/feishu/migration/', '/api/feishu/assistant-template/')) else 128*1024) if self.command == 'POST' else None
                         return self.send_json(200, group_settings.dispatch(path,self.command,data))
                     if path == "/api/feishu" and self.command == "PATCH":
                         save_feishu_settings(feishu_settings_path, self.read_json(), store)
@@ -893,24 +1181,43 @@ def make_handler(store, engine, base_url, allowed_host=None,
                     return self.send_json(200, result)
                 if path == "/api/projects" and self.command == "GET":
                     return self.send_json(200, store.projects())
+                if path == "/api/projects" and self.command == "POST":
+                    if allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1"):
+                        raise BridgeError(403, "local_only", "工作文件夹只能在本机选择")
+                    data = self.read_json()
+                    if not isinstance(data, dict) or set(data) != {"path"}:
+                        raise BridgeError(400, "invalid_request", "请选择一个工作文件夹")
+                    return self.send_json(200, store.register_project_path(data["path"]))
                 if path == "/api/projects/pick" and self.command == "POST":
-                    # Native macOS folder picker; only the panel itself may trigger it.
-                    if self.headers.get("Origin") != base_url or self.read_json() != {}:
-                        raise BridgeError(403, "origin_forbidden", "请从面板选择文件夹")
-                    start = claude_runtime.workspace_root() or Path.home()
-                    # A background agent cannot show UI itself; System Events hosts the dialog.
-                    script = ['-e', 'tell application "System Events"', '-e', 'activate',
-                              '-e', ('set picked to choose folder with prompt "选择这个助手执行任务的工作目录" '
+                    if (allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1")
+                            or self.headers.get("Origin") != base_url):
+                        raise BridgeError(403, "local_only", "请在本机面板选择文件夹")
+                    data = self.read_json()
+                    if not isinstance(data, dict) or set(data) - {"project_id"}:
+                        raise BridgeError(400, "invalid_request", "选择文件夹的请求无效")
+                    if sys.platform != "darwin":
+                        raise BridgeError(501, "folder_picker_unavailable", "当前系统无法打开文件夹选择窗口，请手动填写路径")
+                    start = Path.home()
+                    if data.get("project_id"):
+                        try:
+                            start = Path(store.project(data["project_id"])["path"])
+                        except BridgeError:
+                            pass
+                    script = ["-e", 'tell application "System Events"', "-e", "activate",
+                              "-e", ('set picked to choose folder with prompt "选择机器人或群的工作文件夹" '
                                      f'default location (POSIX file {json.dumps(str(start), ensure_ascii=False)})'),
-                              '-e', 'end tell', '-e', 'POSIX path of picked']
-                    picked = subprocess.run(["osascript", *script], capture_output=True, text=True, timeout=600)
+                              "-e", "end tell", "-e", "POSIX path of picked"]
+                    try:
+                        picked = subprocess.run(["osascript", *script], capture_output=True, text=True, timeout=600)
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        LOG.warning("Native folder picker failed: %s", exc)
+                        raise BridgeError(503, "folder_picker_unavailable", "无法打开文件夹选择窗口，请手动填写路径") from exc
                     if picked.returncode != 0:
                         if "-128" in picked.stderr:
                             return self.send_json(200, {"cancelled": True})
-                        LOG.warning("folder picker failed: %s", picked.stderr.strip()[:300])
-                        raise BridgeError(500, "folder_picker_failed",
-                                          "无法打开文件夹选择窗口：" + (picked.stderr.strip()[:200] or "未知错误"))
-                    project = store.add_project(picked.stdout.strip())
+                        LOG.warning("Native folder picker failed: %s", picked.stderr.strip()[:300])
+                        raise BridgeError(503, "folder_picker_unavailable", "无法打开文件夹选择窗口，请手动填写路径")
+                    project = store.register_project_path(picked.stdout.strip())
                     return self.send_json(200, {"project": project, "projects": store.projects()})
                 if path.startswith("/api/projects/") and self.command == "PATCH":
                     data = self.read_json()
@@ -919,11 +1226,30 @@ def make_handler(store, engine, base_url, allowed_host=None,
                     return self.send_json(200, store.update_project_path(path.rsplit("/", 1)[-1], data["path"]))
                 if path == "/api/connections" and self.command == "GET":
                     return self.send_json(200, store.connections())
+                if path == "/api/connections/deleted" and self.command == "GET":
+                    if allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1"):
+                        raise BridgeError(403, "local_only", "已删除连接只能在本机查看")
+                    return self.send_json(200, store.connections(deleted=True))
                 if path == "/api/connections" and self.command == "POST":
                     data = self.read_json()
                     return self.send_json(201, store.create_connection(data.get("source"), data.get("project_id")))
                 if path.startswith("/api/connections/"):
-                    cid = path.rsplit("/", 1)[-1]
+                    parts = path.split('/')
+                    if self.command == 'POST' and len(parts) == 5 and parts[-1] in ('remove','restore'):
+                        if (allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1")
+                                or self.headers.get('Origin') != base_url):
+                            raise BridgeError(403, 'local_only', '请从本机面板管理连接')
+                        if self.read_json() != {}:
+                            raise BridgeError(400, 'invalid_request', '请求内容无效')
+                        cid = parts[-2]
+                        if parts[-1] == 'remove':
+                            if group_settings and cid in group_settings.managed_connection_ids():
+                                raise BridgeError(409, 'feishu_connection', '这个连接由飞书机器人或群使用，请到飞书页管理')
+                            if feishu_settings_path and not group_settings and cid == load_feishu_settings(feishu_settings_path).get('connection_id'):
+                                raise BridgeError(409, 'feishu_connection', '这个连接由飞书机器人使用，请到飞书页管理')
+                            return self.send_json(200, store.remove_connection(cid))
+                        return self.send_json(200, store.restore_connection(cid))
+                    cid = parts[-1]
                     if self.command == "GET":
                         obj = store.connection(cid, reveal=True)
                         obj["endpoint"] = base_url + "/v1/tasks"
@@ -932,6 +1258,13 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         return self.send_json(200, store.update_connection(cid, self.read_json()))
                 if path == "/api/tasks" and self.command == "GET":
                     return self.send_json(200, store.tasks())
+                if path.startswith("/api/tasks/") and path.endswith("/open-conversation") and self.command == "POST":
+                    if (allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1")
+                            or self.headers.get("Origin") != base_url):
+                        raise BridgeError(403, "local_only", "请从本机面板打开任务对话")
+                    if self.read_json() != {}:
+                        raise BridgeError(400, "invalid_request", "打开对话的请求无效")
+                    return self.send_json(200, open_claude_task_conversation(store, path.split("/")[-2]))
                 if path.startswith("/api/tasks/") and self.command == "GET":
                     return self.send_json(200, store.task(path.rsplit("/", 1)[-1]))
                 if path.startswith("/api/tasks/") and self.command == "PATCH":
@@ -951,6 +1284,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403,'local_only','群话题只允许本机接收器')
                     if self.headers.get('Origin') and self.headers['Origin']!=base_url:raise BridgeError(403,'origin_forbidden','来源无效')
                     connection=store.authenticate(self.headers.get('Authorization',''))
+                    if path=='/v1/group-topics/join' and self.command=='POST':return self.send_json(200,collaboration.topics.join(connection['id'],self.read_json()))
                     if path=='/v1/group-topics/resolve' and self.command=='POST':return self.send_json(200,collaboration.topics.resolve(connection['id'],self.read_json()))
                     if path=='/v1/group-topics/alias' and self.command=='POST':return self.send_json(200,collaboration.topics.alias(connection['id'],self.read_json()))
                     if path=='/v1/group-topics/submit' and self.command=='POST':
@@ -980,10 +1314,24 @@ def make_handler(store, engine, base_url, allowed_host=None,
                     request_id = self.headers.get("Idempotency-Key") or data.get("request_id")
                     status, result = store.submit(connection, data, request_id)
                     return self.send_json(status, result)
+                if path == "/v1/backend" and self.command == "GET":
+                    if allowed_host is not None or self.client_address[0] not in ('127.0.0.1','::1'):
+                        raise BridgeError(403, "local_only", "执行工具信息只供本机接收器使用")
+                    connection = store.authenticate(self.headers.get("Authorization", ""))
+                    return self.send_json(200, {"execution_backend": connection["execution_backend"]})
+                if path.startswith('/v1/tasks/') and path.endswith('/recover') and self.command == 'POST':
+                    if allowed_host is not None or self.client_address[0] not in ('127.0.0.1','::1'):
+                        raise BridgeError(403,'local_only','恢复检查只允许本机接收器')
+                    connection = store.authenticate(self.headers.get('Authorization',''))
+                    task_id = path.split('/')[-2]
+                    store.task(task_id,connection['id'])
+                    return self.send_json(200,engine.request_recovery(task_id))
                 if path.startswith("/v1/tasks/") and self.command == "GET":
                     connection = store.authenticate(self.headers.get("Authorization", ""))
                     task = store.task(path.rsplit("/", 1)[-1], connection["id"])
-                    return self.send_json(200, {"task_id": task["id"], "status": task["status"], "result": task["result"]})
+                    return self.send_json(200, {"task_id": task["id"], "status": task["status"],
+                                                "result": task["result"], "error_code": task.get('error_code'),
+                                                "execution_backend": task["execution_backend"]})
                 raise BridgeError(404, "not_found", "页面不存在")
             except BridgeError as exc:
                 return self.send_json(exc.status, {"error": {"code": exc.code, "message": str(exc), "retryable": exc.retryable}})
@@ -1005,20 +1353,39 @@ def main():
     parser.add_argument("--db", default=os.getenv("BRIDGE_DB", str(ROOT / "data/bridge.sqlite3")))
     parser.add_argument("--projects", default=os.getenv("BRIDGE_PROJECTS", str(ROOT / "projects.json")))
     parser.add_argument("--port", type=int, default=int(os.getenv("BRIDGE_PORT", "8797")))
+    parser.add_argument("--panel-only", action="store_true", help="只打开只读面板，不接收或执行任务")
     args = parser.parse_args()
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     raise_nofile_limit()
     store = Store(args.db, args.projects)
-    if claude_runtime.backend() == "claude":
-        transport = claude_runtime.ClaudeTransport(Path(args.db).parent)
-        LOG.info("execution backend: Claude Code (%s, permission_mode=%s, workspace_root=%s)",
-                 transport.claude_bin, transport.permission_mode, claude_runtime.workspace_root())
-    else:
-        transport = LocalCodexTransport(AppServerClient(os.getenv("CODEX_BIN", "codex")))
-    engine = Engine(store, transport,
-                    history_inbox_path=Path(args.db).parent / 'feishu-inbox.sqlite3')
     base_url = f"http://127.0.0.1:{args.port}"
     feishu_settings_path = Path(os.getenv("FEISHU_CONFIG", str(Path(args.db).parent / "feishu.json")))
+    if args.panel_only:
+        handler = make_handler(store, None, base_url,
+                               feishu_settings_path=feishu_settings_path,
+                               feishu_inbox_path=Path(args.db).parent / 'feishu-inbox.sqlite3')
+
+        class PausedHandler(handler):
+            def do_GET(self):
+                if urlsplit(self.path).path == '/healthz':
+                    return self.send_json(200, {'status': 'paused'})
+                return super().do_GET()
+
+            def do_POST(self):
+                return self.send_json(423, {'error': {'code': 'bridge_paused',
+                                                      'message': 'Bridge 已暂停，面板只能查看'}})
+
+            do_PATCH = do_POST
+
+        server = ThreadingHTTPServer(('127.0.0.1', args.port), PausedHandler)
+        LOG.info('read-only paused panel at %s', base_url)
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+        return
+    engine = Engine(store, LocalCodexTransport(AppServerClient(os.getenv("CODEX_BIN", "codex"),experimental_api=True)),
+                    history_inbox_path=Path(args.db).parent / 'feishu-inbox.sqlite3')
     supervisor = MultiFeishuSupervisor(
         feishu_settings_path, Path(args.db).parent / "feishu-inbox.sqlite3", base_url)
     supervisor.start()

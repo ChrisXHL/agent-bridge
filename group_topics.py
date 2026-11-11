@@ -78,14 +78,15 @@ class GroupTopics:
     def activate_dispatcher(self,connection,data):
         """Only the registered creator's explicit @ may connect a new group."""
         from feishu_groups import application_paths,atomic_write,group_routes
-        from feishu_probe import check_topic_permissions,chat_name
-        from assistant_onboarding import build_prompt
+        from feishu_probe import check_topic_permissions, chat_name
+        from assistant_onboarding import prompt_for_job
         for ref,path,_ in application_paths(self.groups.config_path,self.groups.inbox_path):
             cfg=load(path)
             if cfg.get('connection_id')!=connection:continue
             role=cfg.get('task_dispatcher') or {};chat=data['chat_id']
-            if chat in cfg.get('allowed_chat_ids',[]):return
-            if not role:return self.activate_assistant(ref,path,cfg,connection,data)
+            if not role or chat in cfg.get('allowed_chat_ids',[]):
+                if not role:return self.activate_assistant(connection,data)
+                return
             if (not cfg.get('enabled') or cfg.get('assistant_archived') or not cfg.get('bot_open_id')
                 or data.get('sender_id')!=role.get('owner_open_id') or cfg['bot_open_id'] not in data.get('mentions',[])):
                 raise BridgeError(403,'dispatcher_owner_required','请创建者在这个群里 @任务管家发第一条需求。')
@@ -96,37 +97,61 @@ class GroupTopics:
                 raise BridgeError(403,'dispatcher_owner_required','任务管家的创建者信息还没有核实。')
             check_topic_permissions(cfg['app_id'],cfg['app_secret'])
             routes={r['chat_id']:r for r in group_routes(cfg)}
-            title=chat_name(cfg['app_id'],cfg['app_secret'],chat)
+            title=data.get('name') or chat_name(cfg['app_id'],cfg['app_secret'],chat)
             routes[chat]={'chat_id':chat,'name':title or '任务管家 · '+chat[-6:],'chat_title':title,'connection_id':connection,
-                          'prompt_template':build_prompt(j,credentials,group=True),'enabled':True,'topic_collaboration':True}
+                          'prompt_template':prompt_for_job(j,credentials,group=True),'enabled':True,'topic_collaboration':True}
             cfg.update(group_configs=routes,allowed_chat_ids=list(routes));atomic_write(path,cfg)
             self.c.onboarding.update(j['id'],phase='ready',message='已接入群聊，群里 @我说要做什么就行。')
             return
 
-    def activate_assistant(self,ref,path,cfg,connection,data):
-        """A business assistant joins a new group when its verified creator @s it there; no pairing code."""
-        from feishu_groups import atomic_write,group_routes
+    def activate_assistant(self,connection,data):
+        """Connect an onboarding assistant to a normal group only for its verified creator."""
+        from feishu_groups import application_paths,atomic_write,group_routes
         from feishu_probe import check_topic_permissions,chat_name
-        from assistant_onboarding import build_prompt
-        if (cfg.get('assistant_manager') or not cfg.get('enabled') or cfg.get('assistant_archived')
-                or not cfg.get('bot_open_id') or cfg['bot_open_id'] not in data.get('mentions',[])):return
-        for job_path in sorted((self.groups.config_path.parent/'assistant-onboarding').glob('asst_*/job.json')):
-            j=load(job_path)
-            if j.get('app_ref')!=ref or j.get('kind') in ('manager','dispatcher') or not j.get('plan'):continue
-            credentials=load(job_path.parent/'credentials.json')
-            if credentials.get('app_id')!=cfg['app_id'] or credentials.get('owner_open_id')!=data.get('sender_id'):return
-            try:
-                check_topic_permissions(cfg['app_id'],cfg['app_secret']);topics=True
-            except BridgeError:
-                topics=False  # Without group_msg the group still works with an @ on every message.
-            chat=data['chat_id'];routes={r['chat_id']:r for r in group_routes(cfg)}
-            title=chat_name(cfg['app_id'],cfg['app_secret'],chat)
-            routes[chat]={'chat_id':chat,'name':title or j['name']+' · 群 '+chat[-6:],'chat_title':title,'connection_id':connection,
-                          'prompt_template':build_prompt(j,credentials,group=True),'enabled':True,'topic_collaboration':topics}
-            cfg.update(group_configs=routes,allowed_chat_ids=list(routes));atomic_write(path,cfg)
-            if j.get('phase')=='waiting_group':
-                self.c.onboarding.update(j['id'],phase='ready',message='已接入群聊，群里 @我说要做什么就行。')
-            return
+        from assistant_onboarding import prompt_for_job
+        chat=data.get('chat_id');owner=data.get('sender_id')
+        for ref,path,_ in application_paths(self.groups.config_path,self.groups.inbox_path):
+            cfg=load(path)
+            if cfg.get('connection_id')!=connection:continue
+            if (not cfg.get('enabled') or cfg.get('assistant_archived') or cfg.get('account_archived')
+                    or cfg.get('assistant_manager') or not cfg.get('bot_open_id')):return None
+            if chat in cfg.get('allowed_chat_ids',[]):return {'route':next((r for r in group_routes(cfg) if r['chat_id']==chat),None)}
+            if data.get('mentions') is not None and cfg['bot_open_id'] not in data['mentions']:return None
+            for job_path in sorted((self.groups.config_path.parent/'assistant-onboarding').glob('asst_*/job.json')):
+                j=load(job_path)
+                if j.get('app_ref')!=ref or j.get('kind')=='manager' or not j.get('plan'):continue
+                credentials=load(job_path.parent/'credentials.json')
+                if (credentials.get('app_id')!=cfg.get('app_id') or credentials.get('owner_open_id')!=owner):return None
+                try:check_topic_permissions(cfg['app_id'],cfg['app_secret']);topics=True
+                except BridgeError:topics=False
+                title=data.get('name') or chat_name(cfg['app_id'],cfg['app_secret'],chat)
+                routes={r['chat_id']:r for r in group_routes(cfg)}
+                routes[chat]={'chat_id':chat,'name':title or j['name']+' · 群 '+chat[-6:],
+                              'chat_title':title,'connection_id':connection,
+                              'prompt_template':prompt_for_job(j,credentials,group=True),
+                              'enabled':True,'topic_collaboration':topics}
+                cfg.update(group_configs=routes,allowed_chat_ids=list(routes));atomic_write(path,cfg)
+                if j.get('phase')=='waiting_group':
+                    self.c.onboarding.update(j['id'],phase='ready',message='已接入群聊，群里 @我说要做什么就行。')
+                return {'route':routes[chat]}
+            return None
+        return None
+
+    def join(self,connection,data):
+        if (not isinstance(data,dict) or not {'chat_id','sender_id'}<=set(data) or set(data)-{'chat_id','sender_id','name'}
+                or not isinstance(data['chat_id'],str) or not re.fullmatch(r'oc_[\w-]{1,125}',data['chat_id'])
+                or not isinstance(data['sender_id'],str) or not re.fullmatch(r'ou_[\w-]{1,125}',data['sender_id'])
+                or ('name' in data and (not isinstance(data['name'],str) or len(data['name'])>60))):
+            raise BridgeError(400,'invalid_request','进群事件无效。')
+        with self.c.onboarding.lock,CONFIG_LOCK:
+            from feishu_groups import application_paths,group_routes
+            for _,path,_ in application_paths(self.groups.config_path,self.groups.inbox_path):
+                cfg=load(path)
+                if cfg.get('connection_id')!=connection or not cfg.get('task_dispatcher'):continue
+                self.activate_dispatcher(connection,{**data,'mentions':[cfg.get('bot_open_id')]})
+                updated=load(path)
+                return {'route':next((r for r in group_routes(updated) if r['chat_id']==data['chat_id']),None)}
+            return self.activate_assistant(connection,data) or {'route':None}
 
     def resolve(self,connection,data):
         keys={'chat_id','message_id','parent_id','root_id','mentions','sender_id'}

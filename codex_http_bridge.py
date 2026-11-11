@@ -37,10 +37,11 @@ class RpcError(Exception):
 
 
 class AppServerClient:
-    def __init__(self, codex_bin="codex", timeout=25, on_server_request=None):
+    def __init__(self, codex_bin="codex", timeout=25, on_server_request=None, experimental_api=False):
         from codex_runtime import resolve_codex_binary
         self.codex_bin, self.timeout = resolve_codex_binary(codex_bin), timeout
         self.on_server_request = on_server_request
+        self.experimental_api = experimental_api
         self.proc = None
         self.pending = {}
         self.pending_lock = threading.Lock()
@@ -64,7 +65,7 @@ class AppServerClient:
             threading.Thread(target=self._drain_stderr, args=(self.proc,), daemon=True).start()
             self._call("initialize", {"clientInfo": {
                 "name": "codex_http_bridge", "title": "Codex HTTP Bridge", "version": "0.1.0"
-            }})
+            }, **({"capabilities":{"experimentalApi":True}} if self.experimental_api else {})})
             self._write({"method": "initialized", "params": {}})
 
     def _drain_stderr(self, proc):

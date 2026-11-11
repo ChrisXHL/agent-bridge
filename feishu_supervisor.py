@@ -24,6 +24,9 @@ class FeishuSupervisor:
         self.process = None
         self.signature = None
         self.last_start = 0.0
+        self.log_offset = 0
+        self.connected = False
+        self.connection_lock = threading.Lock()
 
     def status(self):
         if not self.config_path.exists():
@@ -33,7 +36,33 @@ class FeishuSupervisor:
                 return "已停用"
         except (OSError, ValueError):
             return "配置错误"
-        return "进程运行中，待验证飞书连接" if self.process and self.process.poll() is None else "等待启动"
+        if not self.process or self.process.poll() is not None:
+            return "等待启动"
+        return "已连接飞书" if self._socket_connected() else "正在连接飞书"
+
+    def _socket_connected(self):
+        """Observe this worker's SDK connection log without exposing its signed URL."""
+        log_path = self.config_path.parent / "feishu-worker.log"
+        with self.connection_lock:
+            try:
+                with log_path.open("rb") as log_file:
+                    log_file.seek(self.log_offset)
+                    while True:
+                        start = log_file.tell()
+                        line = log_file.readline()
+                        if not line:
+                            break
+                        if not line.endswith(b"\n"):
+                            log_file.seek(start)
+                            break
+                        if b"disconnected to " in line or b"receive message loop exit" in line:
+                            self.connected = False
+                        elif b"connected to " in line:
+                            self.connected = True
+                    self.log_offset = log_file.tell()
+            except OSError:
+                self.connected = False
+            return self.connected
 
     def start(self):
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -48,6 +77,8 @@ class FeishuSupervisor:
                 self.process.kill()
                 self.process.wait(timeout=5)
         self.process = None
+        with self.connection_lock:
+            self.connected = False
 
     def _loop(self):
         while not self.stop.is_set():
@@ -72,6 +103,9 @@ class FeishuSupervisor:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         log_path = self.config_path.parent / "feishu-worker.log"
         with log_path.open("ab") as log_file:
+            with self.connection_lock:
+                self.log_offset = log_file.tell()
+                self.connected = False
             self.process = subprocess.Popen(
                 [sys.executable, str(ROOT / "feishu_worker.py"),
                  "--config", str(self.config_path),

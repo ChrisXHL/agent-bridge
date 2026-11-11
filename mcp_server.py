@@ -10,9 +10,9 @@ BASE = f"http://127.0.0.1:{PORT}"
 TOOLS = [
     {"name":"bridge_environment_status","description":"Diagnose a fresh Bridge installation before dependencies or the service exist. Returns missing requirements and the next action for the agent. Does not install, log in, or create bots.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":True}},
     {"name":"bridge_create_assistant_manager","description":"Create or resume the user's Feishu assistant manager after an explicit creation/setup request. Returns official QR progress; the user must complete QR authorization. Does not recreate an existing manager.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":False,"destructiveHint":False,"idempotentHint":True}},
-    {"name":"bridge_panel","description":"Get the local Agent Bridge task and connection panel URL.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":True}},
-    {"name":"bridge_list_tasks","description":"List external tasks received by Agent Bridge, including current status.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":True}},
-    {"name":"bridge_list_connections","description":"List Agent Bridge source-to-project connections without revealing keys.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":True}},
+    {"name":"bridge_panel","description":"Get the local Codex Bridge task and connection panel URL.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":True}},
+    {"name":"bridge_list_tasks","description":"List external tasks received by Codex Bridge, including current status.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":True}},
+    {"name":"bridge_list_connections","description":"List Codex Bridge source-to-project connections without revealing keys.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":True}},
     {"name":"bridge_feishu_setup_status","description":"Inspect the isolated 2.0 Feishu setup and identify the next setup step without exposing credentials or pairing codes.","inputSchema":{"type":"object","properties":{},"additionalProperties":False},"annotations":{"readOnlyHint":True}},
 ]
 def fetch(path):

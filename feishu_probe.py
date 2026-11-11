@@ -23,14 +23,13 @@ def check_topic_permissions(app_id,app_secret,*,opener=request.urlopen):
     return {'verified':True}
 
 
-def chat_name(app_id, app_secret, chat_id, *, opener=request.urlopen):
-    """The group's display name as the bot sees it, or None when it cannot be read."""
+def chat_name(app_id,app_secret,chat_id,*,opener=request.urlopen):
+    """Best-effort display name; missing chat-read permission must not block joining."""
     try:
-        auth = _call('/auth/v3/tenant_access_token/internal', body={'app_id': app_id, 'app_secret': app_secret}, opener=opener)
-        result = _call('/im/v1/chats/' + chat_id, token=auth.get('tenant_access_token', ''), opener=opener)
-    except Exception:
-        return None
-    name = ((result.get('data') or {}).get('name') or '').strip() if result.get('code') == 0 else ''
+        auth=_call('/auth/v3/tenant_access_token/internal',body={'app_id':app_id,'app_secret':app_secret},opener=opener)
+        result=_call('/im/v1/chats/'+chat_id,token=auth.get('tenant_access_token',''),opener=opener)
+    except Exception:return None
+    name=((result.get('data') or {}).get('name') or '').strip() if result.get('code')==0 else ''
     return name[:60] or None
 
 

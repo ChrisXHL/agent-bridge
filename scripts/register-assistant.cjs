@@ -6,6 +6,10 @@ const QRCode = require('qrcode');
 process.umask(0o077);
 const dir = path.resolve(process.argv[2]);
 const input = JSON.parse(fs.readFileSync(path.join(dir,'registration-input.json'),'utf8'));
+// Jobs created before the existing-bot flow did not record a mode.
+const mode=input.mode||'create';
+if(!['create','existing'].includes(mode))throw new Error('invalid_registration_mode');
+if(mode==='existing'&&!/^cli_[a-z0-9]{16}$/.test(input.app_id||''))throw new Error('missing_existing_app_id');
 const statusPath = path.join(dir,'registration.json');
 function write(name, value) {
  const target=path.join(dir,name), tmp=target+'.'+process.pid+'.tmp';
@@ -17,8 +21,8 @@ async function main(){
  if(fs.existsSync(statusPath)) {throw new Error('existing_attempt');}
  state({status:'starting'});
  const result=await lark.registerApp({
-  createOnly:true,source:'codex-bridge',appPreset:{name:input.name,desc:input.summary},
-  addons:{preset:false,scopes:{tenant:input.scopes},events:{items:{tenant:['im.message.receive_v1']}}},
+  ...(mode==='create'?{createOnly:true,appPreset:{name:input.name,desc:input.summary}}:{appId:input.app_id}),source:'codex-bridge',
+  addons:{preset:false,scopes:{tenant:input.scopes},events:{items:{tenant:input.scopes.includes('im:chat.members:bot_access')?['im.message.receive_v1','im.chat.member.bot.added_v1']:['im.message.receive_v1']}}},
   onQRCodeReady(info){
    const u=new URL(info.url);
    if(u.protocol!=='https:'||!['accounts.feishu.cn','open.feishu.cn','accounts.larksuite.com','open.larksuite.com'].includes(u.hostname))throw new Error('verification_host');
@@ -27,6 +31,7 @@ async function main(){
   }
  });
  if(!result.client_id||!result.client_secret)throw new Error('missing_credentials');
+ if(mode==='existing'&&result.client_id!==input.app_id)throw new Error('existing_app_mismatch');
  // Save before any CLI/Bridge operation so retries never re-create the app.
  write('credentials.json',{app_id:result.client_id,app_secret:result.client_secret,
   owner_open_id:result.user_info?.open_id||'',brand:result.user_info?.tenant_brand||'feishu'});

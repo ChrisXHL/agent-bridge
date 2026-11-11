@@ -1,4 +1,4 @@
-"""Claude Code execution backend (BRIDGE_BACKEND=claude).
+"""Claude Code execution backend for robots explicitly assigned to Claude.
 
 Implements the transport surface the Engine uses (start_thread, send, read,
 resume_thread, release_idle, close) on top of `claude -p`. A Bridge thread maps
@@ -19,15 +19,30 @@ import uuid
 from pathlib import Path
 
 LOG = logging.getLogger("codex_bridge.claude")
+
+
+class ClaudeIdentityRequired(RuntimeError):
+    """The account is logged in, but Anthropic requires an interactive identity check."""
 # Turns run unattended from Feishu messages: tools outside the allowlist are
 # refused (dontAsk). File edits are confined to BRIDGE_WORKSPACE_ROOT.
 DEFAULT_PERMISSION_MODE = "dontAsk"
 OPEN_TOOLS = ["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Task", "TodoWrite", "Skill"]
 
 
+def workspace_root_file():
+    config = os.getenv("FEISHU_CONFIG")
+    return Path(config).parent / "workspace-root.txt" if config else None
+
+
 def workspace_root():
-    value = os.getenv("BRIDGE_WORKSPACE_ROOT")
-    return Path(value).expanduser().resolve() if value else None
+    """The state-dir setting wins over the launch environment, so the root can move without reinstalling."""
+    setting = workspace_root_file()
+    try:
+        value = setting.read_text(encoding="utf-8").strip() if setting and setting.exists() else ""
+    except OSError:
+        value = ""
+    value = value or os.getenv("BRIDGE_WORKSPACE_ROOT")
+    return Path(value).expanduser().absolute() if value else None
 
 
 def permission_settings(mcp_servers=(), cwd=None):
@@ -52,14 +67,19 @@ def mcp_servers_from_init(event):
 
 
 MCP_REFRESH_SECONDS = 600
+# Appended to every turn's system prompt, so it holds for any bot, frozen group
+# topics and resumed sessions alike, independent of each saved prompt.
+REPLY_FORMAT = (
+    "你的最终回答会原样作为飞书聊天消息发出，飞书聊天不渲染 markdown。"
+    "聊天回复只用纯文本：不用 #、**、`、表格、代码块和 - 列表；分点用“1. 2. 3.”或换行。"
+    "先判断输出形式：简短结论、确认或进度直接在聊天里说（一般不超过 15 行）；"
+    "内容含表格、多级结构、超过约 500 字，或需要保存、评审、后续修改时，"
+    "写成飞书文档（文档里可以正常使用 markdown），聊天里只发 3 到 5 行结论和文档链接。"
+)
 TURN_TIMEOUT = int(os.getenv("CLAUDE_TURN_TIMEOUT", str(4 * 3600)))
 # Host-session variables must not leak into service-launched turns.
 _STRIP_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
               "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
-
-
-def backend():
-    return os.getenv("BRIDGE_BACKEND", "codex").strip().lower()
 
 
 def resolve_claude_binary(explicit=None):
@@ -89,10 +109,14 @@ def run_structured(prompt, schema, directory, log_path, timeout=240):
         p = subprocess.run(cmd, input=prompt.encode(), stdout=subprocess.PIPE, stderr=log,
                            cwd=str(directory), env=child_env(), timeout=timeout)
         log.write(p.stdout[-4000:])
-    if p.returncode:
-        raise RuntimeError("claude_exec_failed")
-    value = json.loads(p.stdout)
-    if value.get("is_error") or not isinstance(value.get("structured_output"), dict):
+    try:
+        value = json.loads(p.stdout)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("claude_exec_failed") from exc
+    if (value.get("is_error") and value.get("api_error_status") == 400
+            and "Identity verification is required to continue" in str(value.get("result", ""))):
+        raise ClaudeIdentityRequired("claude_identity_required")
+    if p.returncode or value.get("is_error") or not isinstance(value.get("structured_output"), dict):
         raise RuntimeError("claude_exec_failed")
     return value["structured_output"]
 
@@ -116,6 +140,8 @@ class ClaudeTransport:
             # A turn cannot outlive the service that supervised it.
             db.execute("UPDATE turns SET status='failed',error='Bridge 重启，Claude Code 执行被中断',finished_at=? "
                        "WHERE status='inProgress'", (time.time(),))
+            if 'model' not in {row[1] for row in db.execute('PRAGMA table_info(turns)')}:
+                db.execute('ALTER TABLE turns ADD COLUMN model TEXT')
         self.mcp_path = Path(state_dir) / "claude-mcp-servers.json"
         try:
             self.mcp_servers = set(json.loads(self.mcp_path.read_text()))
@@ -197,7 +223,8 @@ class ClaudeTransport:
     def _run(self, thread, turn_id, message):
         cmd = [self.claude_bin, "-p", "--output-format", "stream-json", "--verbose",
                "--permission-mode", self.permission_mode,
-               "--settings", permission_settings(self._mcp_for_turn(thread["cwd"]), thread["cwd"])]
+               "--settings", permission_settings(self._mcp_for_turn(thread["cwd"]), thread["cwd"]),
+               "--append-system-prompt", REPLY_FORMAT]
         # Read access to Bridge attachments/state and the packaged CLI/docs.
         for extra in (Path(self.path).parent, Path(__file__).resolve().parent):
             cmd += ["--add-dir", str(extra)]
@@ -222,6 +249,10 @@ class ClaudeTransport:
                         except ValueError:
                             continue
                         kind = event.get("type")
+                        if kind=='assistant' or (kind=='system' and event.get('subtype')=='init'):
+                            observed=(event.get('message') or {}).get('model') if kind=='assistant' else event.get('model')
+                            if observed:
+                                with self._db() as db:db.execute('UPDATE turns SET model=? WHERE id=?',(observed,turn_id))
                         if kind == "system" and event.get("subtype") == "init":
                             self._mark_started(thread["id"])
                             found = mcp_servers_from_init(event)
@@ -285,6 +316,23 @@ class ClaudeTransport:
             turns.append(turn)
         active = bool(turns) and turns[-1]["status"] == "inProgress"
         return {"id": thread_id, "status": {"type": "active" if active else "idle"}, "turns": turns}
+
+    def interrupt(self, thread_id):
+        """Stop the thread's running turn; _run then records it as interrupted."""
+        with self._db() as db:
+            row = db.execute("SELECT id FROM turns WHERE thread_id=? AND status='inProgress'", (thread_id,)).fetchone()
+        if not row:
+            return False
+        with self.lock:
+            proc = self.procs.get(row["id"])
+        if proc:
+            self._kill(proc)
+            return True
+        # No live process (e.g. lost across a restart): close the record directly.
+        with self._db() as db:
+            db.execute("UPDATE turns SET status='interrupted',error='已手动取消',finished_at=? WHERE id=?",
+                       (time.time(), row["id"]))
+        return True
 
     def resume_thread(self, thread_id):
         self.read(thread_id)

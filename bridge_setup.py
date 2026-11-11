@@ -70,7 +70,7 @@ def doctor(root=ROOT, state=DEFAULT_STATE, port=8797):
     from codex_runtime import resolve_codex_binary
     codex=resolve_codex_binary(os.getenv('CODEX_BIN'))
     checks={'platform':platform.system()=='Darwin', 'python':(3,11)<=sys.version_info[:2]<(3,14),
-            'python_dependencies':python.is_file() and probe([str(python),'-c','import lark_oapi'],root,timeout=30),
+            'python_dependencies':python.is_file() and probe([str(python),'-c','import lark_oapi, cryptography'],root,timeout=30),
             'node':bool(node) and probe([node,'--version'],root),
             'npm':bool(npm) and probe([npm,'--version'],root),
             'node_dependencies':False,
@@ -173,8 +173,6 @@ def install(root=ROOT,state=DEFAULT_STATE,port=8797):
                 'StandardOutPath':str(state/'service.log'),'StandardErrorPath':str(state/'service-error.log'),
                 'EnvironmentVariables':{'PATH':env['PATH'],'CODEX_BIN':codex,'FEISHU_CONFIG':str(state/'feishu.json'),'BRIDGE_REQUIRE_APP':'0','PYTHONUNBUFFERED':'1'}}
         if os.getenv('BRIDGE_PROJECT_DISCOVERY')=='0':config['EnvironmentVariables']['BRIDGE_PROJECT_DISCOVERY']='0'
-        for name in ('BRIDGE_BACKEND','BRIDGE_WORKSPACE_ROOT','CLAUDE_BIN','CLAUDE_MODEL','CLAUDE_PERMISSION_MODE'):
-            if os.getenv(name):config['EnvironmentVariables'][name]=os.environ[name]
         plist.parent.mkdir(parents=True,exist_ok=True);plist.write_bytes(plistlib.dumps(config));plist.chmod(0o600)
         run_logged(['launchctl','bootout',f'gui/{os.getuid()}/{label}'],state,root,timeout=10) if probe(['launchctl','print',f'gui/{os.getuid()}/{label}'],root) else None
         run_logged(['launchctl','bootstrap',f'gui/{os.getuid()}',str(plist)],state,root,timeout=15)

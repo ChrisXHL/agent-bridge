@@ -3,12 +3,17 @@ name: codex-bridge
 description: Install, diagnose, recover and connect the local Feishu-to-Codex Bridge; create an assistant manager via official QR and inspect real task delivery.
 ---
 
-# Agent Bridge (based on Codex Bridge 2.6)
+# Codex Bridge 2.6
 
 Use bridge_panel for the panel URL, bridge_list_tasks for external tasks,
 bridge_list_connections for source-to-project bindings and bridge_feishu_setup_status
 for setup progress. Never show connection keys or App Secret in ordinary chat.
 Queued means accepted by Bridge, not confirmed execution or delivery.
+For an accepted Feishu message, the bot sends a short receipt immediately;
+the separate final reply reports the actual outcome. A receipt is not proof
+that a Codex task has started or completed. This applies to private business
+assistants, group mentions and the assistant manager. Disabled or unauthorized
+routes stay silent.
 
 For installation, first-time setup, sharing or recovery, read
 [Agent setup](references/agent-setup.md). Run the packaged bridge-setup commands
@@ -37,9 +42,22 @@ run a multistage workflow engine. Do not call the retired workflow/card tools.
 
 For a group task coordinator, use “创建任务管家” or POST /api/feishu/dispatcher
 with an empty JSON body. Reuse its existing creation record. The owner completes
-the official creation QR, adds it to an ordinary group and sends the first @ request.
-Only that application's verified creator may activate a new group this way;
-the same message starts the task without a pairing-code step. The coordinator
+the official creation QR and adds it to an ordinary group. New bots subscribe to
+the bot-added event and connect that group automatically. For older bots without
+that event, the creator's first @ request connects the group and starts the task.
+Only that application's verified creator may activate a new group this way.
+
+To link an existing Feishu bot, use the panel's “接入已有机器人” or POST
+/api/feishu/onboarding/existing with {"app_id":"cli_...","project_id":"..."}.
+Select an installed Feishu CLI profile or obtain the existing App ID; never
+start a create-new-app flow. The appId is pinned in the official QR flow, and
+the returned App ID must match. The owner scans and confirms changes to that
+application. Bridge stores credentials privately and creates a connection to
+the selected existing project, without a new assistant or project. A bot already
+connected to Bridge keeps its existing configuration. Existing apps need long-connection
+event delivery and an effective published release. The first real message and
+reply are still required to prove delivery.
+The coordinator
 discovers and calls only business assistants already bound to that group.
 Existing consent rules still apply; group membership does not grant access to
 other assistants' private data or authorize unrelated assistants.

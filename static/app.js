@@ -1,7 +1,7 @@
 const $ = id => document.getElementById(id);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const savedPage=sessionStorage.getItem('bridgePage');
-const state = {page:['tasks','connections','feishu'].includes(savedPage)?savedPage:'tasks', projects:[], connections:[], tasks:[], feishu:null, feishuDirty:false, promptDirty:false, quickDirty:false, newConnection:null, history:false, drawer:null, pending:{setup:false,check:false,pair:false,advanced:false,connection:false,approval:false}};
+const state = {page:['tasks','connections','feishu'].includes(savedPage)?savedPage:'tasks', projects:[], connections:[], deletedConnections:[], connectionToRemove:null, connectionChangeBusy:false, feishuConnectionIds:new Set(), feishuConnectionNames:new Set(), feishuCatalogReady:false, feishuCatalogError:'', tasks:[], feishu:null, feishuDirty:false, promptDirty:false, quickDirty:false, newConnection:null, history:false, drawer:null, pending:{setup:false,check:false,pair:false,advanced:false,connection:false,approval:false}};
 const statusClass = s => ({'等待 Codex':'wait','执行中':'run','流程进行中':'run','等待审核':'need','流程受阻':'need','需要你处理':'need','已完成':'done','失败':'fail','已停止':'fail','待验证':'wait','可用':'done','已停用':'fail'})[s] || 'wait';
 const badge = s => `<span class="status ${statusClass(s)}"><span class="s-dot"></span>${esc(s)}</span>`;
 const timeText = ts => new Date(ts*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
@@ -17,9 +17,19 @@ async function api(path, options={}) {
 function toast(message) { $('toast').textContent=message; $('toast').classList.add('show'); clearTimeout(window.toastTimer); window.toastTimer=setTimeout(()=>$('toast').classList.remove('show'),2500); }
 function feedback(id, message='', tone='info') { const element=$(id); element.textContent=message; element.className='inline-feedback'+(message?' '+tone:' hidden'); }
 function stepState(id, label, tone='') { const element=$(id); element.textContent=label; element.className='step-state'+(tone?' '+tone:''); }
-function switchPage(page) { state.page=page; sessionStorage.setItem('bridgePage',page); for(const name of ['tasks','connections','feishu']) { $(name+'Page').classList.toggle('hidden',page!==name); $('nav'+name[0].toUpperCase()+name.slice(1)).classList.toggle('active',page===name); } $('pageTitle').textContent=({tasks:'任务',connections:'连接',feishu:'飞书',})[page]; $('pageSubtitle').textContent=({tasks:'外部系统交给 Codex 的任务。',connections:'管理谁可以给哪些 Codex 项目派任务。',feishu:'在这台 Mac 上直接接收飞书消息。'})[page]; $('primaryAction').classList.toggle('hidden',page!=='connections'); if(page==='feishu') renderFeishu();  }
-function taskStatus(t){return t.error_code==='assistant_authorization_required'?'等待协作确认':t.error_code==='group_question_pending'?'等待委托助手答复':t.display_status||t.status;}
-function taskRow(t) { return `<div class="task" data-task="${esc(t.id)}"><div class="task-main"><div class="meta-row"><span class="source-chip">${esc(t.source)}</span><span class="arrow">→</span><span>${esc(t.project_name)}</span></div><div class="task-title">${esc(t.archive_name||t.title)}</div></div>${badge(taskStatus(t))}<div class="time">${timeText(t.updated_at)}</div></div>`; }
+function switchPage(page) { state.page=page; sessionStorage.setItem('bridgePage',page); for(const name of ['tasks','connections','feishu']) { $(name+'Page').classList.toggle('hidden',page!==name); $('nav'+name[0].toUpperCase()+name.slice(1)).classList.toggle('active',page===name); } $('pageTitle').textContent=({tasks:'任务',connections:'连接',feishu:'飞书',})[page]; $('pageSubtitle').textContent=({tasks:'查看机器人接到的任务与结果。',connections:'管理外部任务来源和工作目录。',feishu:'按账号管理机器人、群和执行工具。'})[page]; $('primaryAction').classList.toggle('hidden',page!=='connections'); if(page==='feishu') renderFeishu();  }
+function taskStatus(t){return t.error_code==='assistant_authorization_required'?'等待协作确认':t.error_code==='group_question_pending'?'等待委托助手答复':t.execution_backend==='claude'&&t.status==='等待 Codex'?'等待 Claude Code':t.display_status||t.status;}
+function conversationAction(t,detail=false){
+ const label=detail?(t.execution_backend==='claude'?'在终端打开 Claude 对话':'打开 Codex 对话'):'打开对话';
+ const style=detail?'btn ghost':'task-conversation-link';
+ if(!t.thread_id)return `<button class="${style}" type="button" disabled title="任务尚未建立对话">${label}</button>`;
+ if(t.execution_backend==='claude'){
+  const busy=t.status==='等待 Codex'||t.status==='执行中';
+  return `<button class="${style}" type="button" data-open-conversation="${esc(t.id)}" ${busy?'disabled title="Claude 正在执行，完成后可打开"':''}>${label}</button>`;
+ }
+ return `<a class="${style}" href="codex://threads/${encodeURIComponent(t.thread_id)}">${label}</a>`;
+}
+function taskRow(t) { return `<div class="task" data-task="${esc(t.id)}"><div class="task-main"><div class="meta-row"><span class="source-chip">${esc(t.source)}</span><span class="arrow">→</span><span>${esc(t.project_name)}</span></div><div class="task-title">${esc(t.archive_name||t.title)}</div></div>${badge(taskStatus(t))}<div class="task-tail"><div class="time">${timeText(t.updated_at)}</div>${conversationAction(t)}</div></div>`; }
 function renderTasks() {
  const tasks=state.tasks; const attention=tasks.filter(t=>['需要你处理','流程受阻','等待审核'].includes(taskStatus(t))); const others=tasks.filter(t=>!attention.includes(t));
  const paired=(state.feishu?.allowed_open_ids||[]).length>0||(state.feishu?.allowed_chat_ids||[]).length>0;
@@ -31,20 +41,39 @@ function renderTasks() {
  $('recentCount').textContent=Math.min(others.length,8); setHtmlIfChanged('recentList',others.slice(0,8).map(taskRow).join(''));
  $('historyToggle').classList.toggle('hidden',others.length<=8); $('historyList').classList.toggle('hidden',!state.history); setHtmlIfChanged('historyItems',others.slice(8).map(taskRow).join('')); $('historyChevron').textContent=state.history?'⌄':'›';
 }
-function renderConnections() { setHtmlIfChanged('connectionsGrid',state.connections.map(c=>`<div class="conn-card"><div class="conn-head"><div><div class="conn-title">${esc(c.source)} → ${esc(c.project_name)}</div></div>${badge(c.status)}</div><div class="conn-actions"><button class="btn" data-copy="${esc(c.id)}">复制连接信息</button><button class="btn ghost" data-settings="${esc(c.id)}">设置</button></div></div>`).join('') || '<div class="empty-card">还没有连接。点击右上角创建连接。</div>'); }
+function renderConnections() {
+ if(!state.feishuCatalogReady){setHtmlIfChanged('connectionsGrid',`<div class="empty-card">${state.feishuCatalogError?'飞书连接暂时无法读取，请刷新页面后重试。':'正在整理连接…'}</div>`);return;}
+ const other=state.connections.filter(c=>!state.feishuConnectionIds.has(c.id)&&!state.feishuConnectionNames.has(c.source.trim()));
+ const cards=other.map(c=>`<div class="conn-card"><div class="conn-head"><div><div class="conn-title">${esc(c.source)} → ${esc(c.project_name)}</div><div class="config-help">${c.execution_backend==='claude'?'Claude Code CLI':'Codex CLI · GPT'}</div></div>${badge(c.status)}</div><div class="conn-actions"><button class="btn" data-copy="${esc(c.id)}">复制连接信息</button><button class="btn ghost" data-settings="${esc(c.id)}">设置</button><button class="btn ghost" data-remove-connection="${esc(c.id)}">删除</button></div>${state.connectionToRemove===c.id?`<div class="conn-remove-confirm"><p>删除后将停止接收新任务，历史任务保留。可从「已删除连接」恢复。</p><button class="btn" data-cancel-remove-connection="${esc(c.id)}">取消</button> <button class="btn primary" data-confirm-remove-connection="${esc(c.id)}" ${state.connectionChangeBusy?'disabled':''}>确认删除</button></div>`:''}</div>`).join('');
+ const removed=state.deletedConnections;
+ const archive=removed.length?`<details class="removed-connections"><summary>已删除连接 · ${removed.length}</summary>${removed.map(c=>`<div class="removed-connection"><span>${esc(c.source)} → ${esc(c.project_name)}</span><button class="btn ghost" data-restore-connection="${esc(c.id)}" ${state.connectionChangeBusy?'disabled':''}>恢复</button></div>`).join('')}</details>`:'';
+ setHtmlIfChanged('connectionsGrid',(cards||'<div class="empty-card">没有其他连接。飞书机器人和群请在「飞书」页管理。</div>')+archive);
+}
+window.addEventListener('bridge:feishu-connections',e=>{
+ if(e.detail?.error){state.feishuCatalogError=e.detail.error;renderConnections();return;}
+ state.feishuConnectionIds=new Set(e.detail?.ids||[]);
+ state.feishuConnectionNames=new Set(e.detail?.names||[]);
+ state.feishuCatalogReady=true;state.feishuCatalogError='';renderConnections();
+});
 let refreshPromise=null;
 async function refresh(force=false) {
  if(refreshPromise){ if(!force)return refreshPromise; await refreshPromise; }
  const request=(async()=>{
   try {
-   const [projects,connections,tasks,feishu]=await Promise.all([api('/api/projects'),api('/api/connections'),api('/api/tasks'),api('/api/feishu')]);
-   state.projects=projects; state.connections=connections; state.tasks=tasks; state.feishu=feishu;
+   const [runtime,projects,connections,deletedConnections,tasks,feishu]=await Promise.all([api('/healthz'),api('/api/projects'),api('/api/connections'),api('/api/connections/deleted'),api('/api/tasks'),api('/api/feishu')]);
+   state.projects=projects; state.connections=connections; state.deletedConnections=deletedConnections; state.tasks=tasks; state.feishu=feishu;
    renderTasks(); renderConnections(); if(state.page==='feishu')renderFeishu(); 
-   $('serviceNotice').classList.add('hidden');
+   const paused=runtime.status==='paused';
+   $('serviceNotice').classList.toggle('hidden',!paused);
+   $('serviceNotice').classList.toggle('paused',paused);
+   $('retryRefresh').classList.toggle('hidden',paused);
+   if(paused)$('serviceNoticeText').textContent='Bridge 已暂停。这里仅供查看，列表中的任务状态是暂停前的记录；飞书消息、定时任务和待处理任务都不会继续执行。';
    if(state.drawer?.kind==='task')await showTask(state.drawer.id,false);
    return true;
   } catch(e) {
    $('serviceNoticeText').textContent='面板数据暂时无法更新：'+e.message+'。当前内容可能不是最新的。';
+   $('serviceNotice').classList.remove('paused');
+   $('retryRefresh').classList.remove('hidden');
    $('serviceNotice').classList.remove('hidden');
    return false;
   }
@@ -199,16 +228,15 @@ async function showTask(id,focus=true) {
   const t=await api('/api/tasks/'+encodeURIComponent(id));
   if(!focus && state.drawer?.id!==id)return;
   const messages=t.messages.map(m=>`<div class="result-box" style="white-space:pre-wrap;margin:10px 0"><small>${timeText(m.created_at)}</small><p>${esc(m.content)}</p></div>`).join('');
-  let action='';
-  if(!t.archived && t.status==='需要你处理' && !['assistant_authorization_required','group_question_pending'].includes(t.error_code) && t.thread_id)action=`<a class="btn primary" href="codex://threads/${encodeURIComponent(t.thread_id)}">去 Codex 处理</a>`;
-  if(!t.archived && t.error_code==='project_unavailable')action=`<button class="btn primary" data-repath="${esc(t.connection_id)}">重新选择项目</button>`;
+  let action=conversationAction(t,true);
+  if(!t.archived && t.error_code==='project_unavailable')action+=` <button class="btn primary" data-repath="${esc(t.connection_id)}">重新选择项目</button>`;
   if(!t.archived && t.approval)action+=`<div class="cred"><p>${esc(t.approval.detail)}</p><button class="btn primary" data-approval="${esc(t.approval.id)}" data-decision="accept" ${state.pending.approval?'disabled':''}>允许此操作</button> <button class="btn" data-approval="${esc(t.approval.id)}" data-decision="decline" ${state.pending.approval?'disabled':''}>拒绝</button></div>`;
   const collaboration=(t.collaboration?`<section class="detail-section"><h3>协作任务 · ${esc(t.collaboration.name)}</h3><button class="mini-link" data-task="${esc(t.collaboration.parent_task_id)}">查看委托任务</button><p class="config-help">结果交回委托助手，由最初接待你的助手统一回复。</p></section>`:'')+(t.children?.length?`<section class="detail-section"><h3>分配给其他助手的任务</h3>${t.children.map(c=>`<p><button class="mini-link" data-task="${esc(c.id)}">${esc(c.name)}</button> · ${esc(taskStatus(c))}</p>`).join('')}</section>`:'');
-  const html=`<h2 class="detail-title">${esc(t.archive_name||t.title)}</h2><div class="detail-grid"><div class="detail-item"><label>状态</label><strong>${esc(taskStatus(t))}</strong></div><div class="detail-item"><label>时间</label><strong>${timeText(t.created_at)}</strong></div></div>${t.archived?'<p class="config-help">这是改版前的历史记录，仅供查看。新任务请从飞书发送一条新消息，将按当前 Prompt 执行。</p>':''}${collaboration}<section class="detail-section"><h3>任务回复</h3><div class="result-box" style="white-space:pre-wrap">${esc(t.result||'尚无回复。')}</div><div style="margin-top:12px">${action}</div></section><details class="detail-section"><summary>任务消息记录</summary>${messages}</details>`;
+  const html=`<h2 class="detail-title">${esc(t.archive_name||t.title)}</h2><div class="detail-grid"><div class="detail-item"><label>状态</label><strong>${esc(taskStatus(t))}</strong></div><div class="detail-item"><label>执行工具</label><strong>${t.execution_backend==='claude'?'Claude Code CLI':'Codex CLI · GPT'}</strong></div><div class="detail-item"><label>时间</label><strong>${timeText(t.created_at)}</strong></div></div>${t.archived?'<p class="config-help">这是改版前的历史记录，仅供查看。新任务请从飞书发送一条新消息，将按当前 Prompt 执行。</p>':''}${collaboration}<section class="detail-section"><h3>任务回复</h3><div class="result-box" style="white-space:pre-wrap">${esc(t.result||'尚无回复。')}</div><div style="margin-top:12px">${action}</div></section><details class="detail-section"><summary>任务消息记录</summary>${messages}</details>`;
   openOverlay('task','任务详情',html);state.drawer={kind:'task',id};
  }catch(e){toast(e.message);}
 }
-function connectionText(c) { return `请通过这个连接给我的 Codex 发送任务：\n连接：${c.source} → ${c.project_name}\n接口：${c.endpoint}\n密钥：${c.api_key}\n\n新任务：POST 接口，Authorization: Bearer <密钥>，Content-Type: application/json，JSON: {"message":"任务内容","request_id":"唯一请求编号"}。\n继续同一个任务：在 JSON 中加上返回的 task_id；每条新消息使用新的 request_id。\n查询状态：GET ${c.endpoint}/<task_id>，使用同一密钥。`; }
+function connectionText(c) { return `请通过这个连接发送任务：\n连接：${c.source} → ${c.project_name}\n执行工具：${c.execution_backend==='claude'?'Claude Code CLI':'Codex CLI · GPT'}\n接口：${c.endpoint}\n密钥：${c.api_key}\n\n新任务：POST 接口，Authorization: Bearer <密钥>，Content-Type: application/json，JSON: {"message":"任务内容","request_id":"唯一请求编号"}。\n继续同一个任务：在 JSON 中加上返回的 task_id；每条新消息使用新的 request_id。\n查询状态：GET ${c.endpoint}/<task_id>，使用同一密钥。`; }
 function legacyCopy(text) {
  const field=document.createElement('textarea');
  field.value=text;
@@ -242,7 +270,7 @@ async function copyConnection(id) {
   else showManualCopy(text);
  } catch(e) { toast(e.message); }
 }
-async function showSettings(id, revealRepair=false) { feedback('drawerFeedback'); try { const c=await api('/api/connections/'+encodeURIComponent(id)); const project=state.projects.find(p=>p.id===c.project_id); const html=`<div class="meta-row" style="margin-bottom:12px">连接设置</div><h2 class="detail-title">${esc(c.source)} → ${esc(c.project_name)}</h2><div class="detail-grid"><div class="detail-item"><label>状态</label><strong>${esc(taskStatus(c))}</strong></div><div class="detail-item"><label>创建时间</label><strong>${timeText(c.created_at)}</strong></div></div><button class="btn" data-copy="${esc(id)}">复制连接信息</button> <button class="btn ghost" data-toggle="${esc(id)}">${c.status==='已停用'?'重新启用':'停用连接'}</button><div class="detail-section hidden" id="projectRepair"><h3>重新选择项目位置</h3><p style="font-size:12px;color:var(--muted)">项目文件夹移动后，在这里填入它的新位置。</p><input class="input" id="projectPath" value="${esc(project?.path||'')}" aria-label="项目文件夹位置"><button class="btn" style="margin-top:10px" data-save-path="${esc(c.project_id)}">保存项目位置</button></div><div class="detail-section"><button class="mini-link" id="showTechnical">查看技术信息</button><div class="cred hidden" id="technicalDetails"><div class="cred-label">接口地址</div><div class="cred-value" style="white-space:normal;word-break:break-all">${esc(c.endpoint)}</div><div class="cred-label" style="margin-top:12px">密钥</div><div class="cred-value" style="white-space:normal;word-break:break-all">${esc(c.api_key)}</div><div class="cred-label" style="margin-top:12px">Codex 项目标识</div><div class="cred-value">${esc(c.project_id)}</div></div></div>`; openOverlay('settings','连接设置',html); state.drawer={kind:'settings',id}; if(revealRepair) $('projectRepair').classList.remove('hidden'); } catch(e){toast(e.message);} }
+async function showSettings(id, revealRepair=false) { feedback('drawerFeedback'); try { const c=await api('/api/connections/'+encodeURIComponent(id)); if(c.deleted_at){openOverlay('settings','连接设置',`<h2 class="detail-title">${esc(c.source)} → ${esc(c.project_name)}</h2><p class="config-help">这个连接已删除，历史任务仍可查看。</p><button class="btn" data-restore-connection="${esc(id)}">恢复连接</button>`);state.drawer={kind:'settings',id};return;} const project=state.projects.find(p=>p.id===c.project_id); const html=`<div class="meta-row" style="margin-bottom:12px">连接设置</div><h2 class="detail-title">${esc(c.source)} → ${esc(c.project_name)}</h2><div class="detail-grid"><div class="detail-item"><label>状态</label><strong>${esc(taskStatus(c))}</strong></div><div class="detail-item"><label>创建时间</label><strong>${timeText(c.created_at)}</strong></div></div><button class="btn" data-copy="${esc(id)}">复制连接信息</button> <button class="btn ghost" data-toggle="${esc(id)}">${c.status==='已停用'?'重新启用':'停用连接'}</button><div class="detail-section hidden" id="projectRepair"><h3>重新选择项目位置</h3><p style="font-size:12px;color:var(--muted)">项目文件夹移动后，在这里填入它的新位置。</p><input class="input" id="projectPath" value="${esc(project?.path||'')}" aria-label="项目文件夹位置"><button class="btn" style="margin-top:10px" data-save-path="${esc(c.project_id)}">保存项目位置</button></div><div class="detail-section"><button class="mini-link" id="showTechnical">查看技术信息</button><div class="cred hidden" id="technicalDetails"><div class="cred-label">接口地址</div><div class="cred-value" style="white-space:normal;word-break:break-all">${esc(c.endpoint)}</div><div class="cred-label" style="margin-top:12px">密钥</div><div class="cred-value" style="white-space:normal;word-break:break-all">${esc(c.api_key)}</div><div class="cred-label" style="margin-top:12px">Codex 项目标识</div><div class="cred-value">${esc(c.project_id)}</div></div></div>`; openOverlay('settings','连接设置',html); state.drawer={kind:'settings',id}; if(revealRepair) $('projectRepair').classList.remove('hidden'); } catch(e){toast(e.message);} }
 function updateRoute() { const source=$('sourceName').value.trim()||'任务来源'; const project=state.projects.find(p=>p.id===$('projectSelect').value); $('routePreview').textContent=`${source} → ${project?.name||'Codex 项目'}`; }
 async function openNewConnection() {
  try{state.projects=await api('/api/projects');}catch(e){toast(e.message);return;}
@@ -273,7 +301,24 @@ async function nextStep(){
  }catch(e){feedback('connectionFeedback',e.message,'error');}
  finally{state.pending.connection=false;$('nextBtn').disabled=false;$('cancelBtn').disabled=false;if(!state.newConnection)$('nextBtn').textContent='创建连接';}
 }
-document.addEventListener('click',async e=>{ const target=e.target.closest('button,[data-task],a'); if(!target)return; if(target.id==='quickConfirmPair')return quickPair('confirm'); if(target.dataset.page) return switchPage(target.dataset.page); if(target.dataset.task) return showTask(target.dataset.task); if(target.dataset.approval){ if(state.pending.approval)return; const taskId=state.drawer?.id; state.pending.approval=true; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=true); feedback('drawerFeedback','正在提交决定…'); try{await api('/api/approvals/'+encodeURIComponent(target.dataset.approval),{method:'POST',body:JSON.stringify({decision:target.dataset.decision})}); state.pending.approval=false; await showTask(taskId,false); feedback('drawerFeedback','决定已提交，任务状态已更新。','success');}catch(err){state.pending.approval=false; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=false); feedback('drawerFeedback',err.message,'error');} return; } if(target.dataset.copy) return copyConnection(target.dataset.copy); if(target.dataset.repath) return showSettings(target.dataset.repath,true); if(target.dataset.settings) return showSettings(target.dataset.settings); if(target.dataset.toggle){ try{const c=state.connections.find(x=>x.id===target.dataset.toggle); await api('/api/connections/'+encodeURIComponent(c.id),{method:'PATCH',body:JSON.stringify({status:c.status==='已停用'?'待验证':'已停用'})}); await refresh(); await showSettings(c.id); toast('连接设置已更新');}catch(err){toast(err.message);} return;} if(target.dataset.savePath){try{await api('/api/projects/'+encodeURIComponent(target.dataset.savePath),{method:'PATCH',body:JSON.stringify({path:$('projectPath').value})}); await refresh(); toast('项目位置已更新');}catch(err){toast(err.message);}return;} if(target.id==='showTechnical'){ $('technicalDetails').classList.toggle('hidden'); return $('projectRepair').classList.toggle('hidden'); } });
+document.addEventListener('click',async e=>{ const target=e.target.closest('button,[data-task],a'); if(!target)return; if(target.id==='quickConfirmPair')return quickPair('confirm'); if(target.dataset.page) return switchPage(target.dataset.page); if(target.dataset.openConversation){target.disabled=true;const label=target.textContent;target.textContent='正在打开…';try{await api('/api/tasks/'+encodeURIComponent(target.dataset.openConversation)+'/open-conversation',{method:'POST',body:'{}'});toast('Claude 对话已在终端打开');}catch(err){toast(err.message);}finally{target.disabled=false;target.textContent=label;}return;} if(target.dataset.task) return showTask(target.dataset.task); if(target.dataset.approval){ if(state.pending.approval)return; const taskId=state.drawer?.id; state.pending.approval=true; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=true); feedback('drawerFeedback','正在提交决定…'); try{await api('/api/approvals/'+encodeURIComponent(target.dataset.approval),{method:'POST',body:JSON.stringify({decision:target.dataset.decision})}); state.pending.approval=false; await showTask(taskId,false); feedback('drawerFeedback','决定已提交，任务状态已更新。','success');}catch(err){state.pending.approval=false; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=false); feedback('drawerFeedback',err.message,'error');} return; } if(target.dataset.copy) return copyConnection(target.dataset.copy); if(target.dataset.repath) return showSettings(target.dataset.repath,true); if(target.dataset.settings) return showSettings(target.dataset.settings); if(target.dataset.toggle){ try{const c=state.connections.find(x=>x.id===target.dataset.toggle); await api('/api/connections/'+encodeURIComponent(c.id),{method:'PATCH',body:JSON.stringify({status:c.status==='已停用'?'待验证':'已停用'})}); await refresh(); await showSettings(c.id); toast('连接设置已更新');}catch(err){toast(err.message);} return;} if(target.dataset.savePath){try{await api('/api/projects/'+encodeURIComponent(target.dataset.savePath),{method:'PATCH',body:JSON.stringify({path:$('projectPath').value})}); await refresh(); toast('项目位置已更新');}catch(err){toast(err.message);}return;} if(target.id==='showTechnical'){ $('technicalDetails').classList.toggle('hidden'); return $('projectRepair').classList.toggle('hidden'); } });
+document.addEventListener('click',async e=>{
+ const button=e.target.closest('[data-remove-connection],[data-cancel-remove-connection],[data-confirm-remove-connection],[data-restore-connection]');
+ if(!button||state.connectionChangeBusy)return;
+ if(button.dataset.removeConnection){state.connectionToRemove=button.dataset.removeConnection;renderConnections();return;}
+ if(button.dataset.cancelRemoveConnection){state.connectionToRemove=null;renderConnections();return;}
+ const id=button.dataset.confirmRemoveConnection||button.dataset.restoreConnection;
+ const restoring=!!button.dataset.restoreConnection;
+ state.connectionChangeBusy=true;button.disabled=true;
+ try{
+  await api('/api/connections/'+encodeURIComponent(id)+(restoring?'/restore':'/remove'),{method:'POST',body:'{}'});
+  state.connectionToRemove=null;
+  await refresh(true);
+  if(restoring&&state.drawer?.kind==='settings'&&state.drawer.id===id)closeDrawer();
+  toast(restoring?'连接已恢复':'连接已删除，历史任务已保留');
+ }catch(err){toast(err.message);}
+ finally{state.connectionChangeBusy=false;renderConnections();}
+});
 $('primaryAction').onclick=openNewConnection; $('firstConnect').onclick=()=>switchPage('feishu'); $('firstOtherConnect').onclick=()=>{switchPage('connections');openNewConnection();}; $('closeDrawer').onclick=closeDrawer; $('closeModal').onclick=closeModal; $('cancelBtn').onclick=closeModal; $('overlay').onclick=()=>{closeDrawer();closeModal();}; $('nextBtn').onclick=nextStep; $('backBtn').onclick=()=>{}; $('sourceName').oninput=()=>{updateRoute();feedback('connectionFeedback');}; $('projectSelect').onchange=()=>{updateRoute();feedback('connectionFeedback');}; $('copyNew').onclick=()=>copyConnection(state.newConnection.id); $('showNewTechnical').onclick=async()=>{const c=await api('/api/connections/'+encodeURIComponent(state.newConnection.id)); $('newTechnical').innerHTML=`<div class="cred-label">接口地址</div><div class="cred-value" style="white-space:normal">${esc(c.endpoint)}</div><div class="cred-label" style="margin-top:12px">密钥</div><div class="cred-value" style="white-space:normal;word-break:break-all">${esc(c.api_key)}</div>`; $('newTechnical').classList.toggle('hidden');}; $('historyToggle').onclick=()=>{state.history=!state.history;renderTasks();}; document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeDrawer();closeModal();}});
 $('feishuForm').addEventListener('submit',saveFeishu);
 $('feishuForm').addEventListener('input',e=>{state.feishuDirty=true;feedback('advancedFeedback');validateFeishuPrompt();});
