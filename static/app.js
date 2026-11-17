@@ -3,7 +3,9 @@ const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 const savedPage=sessionStorage.getItem('bridgePage');
 const state = {page:['tasks','connections','feishu'].includes(savedPage)?savedPage:'tasks', projects:[], connections:[], deletedConnections:[], connectionToRemove:null, connectionChangeBusy:false, feishuConnectionIds:new Set(), feishuConnectionNames:new Set(), feishuCatalogReady:false, feishuCatalogError:'', tasks:[], feishu:null, feishuDirty:false, promptDirty:false, quickDirty:false, newConnection:null, history:false, drawer:null, pending:{setup:false,check:false,pair:false,advanced:false,connection:false,approval:false}};
 const statusClass = s => ({'等待 Codex':'wait','执行中':'run','流程进行中':'run','等待审核':'need','流程受阻':'need','需要你处理':'need','已完成':'done','失败':'fail','已停止':'fail','待验证':'wait','可用':'done','已停用':'fail'})[s] || 'wait';
-const badge = s => `<span class="status ${statusClass(s)}"><span class="s-dot"></span>${esc(s)}</span>`;
+const badge = (s,label=s) => `<span class="status ${statusClass(s)}" title="${esc(s)}"><span class="s-dot"></span>${esc(label)}</span>`;
+const backendName = t => t.execution_backend==='claude'?'Claude':'Codex';
+const taskBadge = t => { const s=taskStatus(t); return badge(s, statusClass(s)==='run'?backendName(t):s); };
 const timeText = ts => new Date(ts*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
 async function api(path, options={}) {
  let response;
@@ -15,9 +17,9 @@ async function api(path, options={}) {
  return result;
 }
 function toast(message) { $('toast').textContent=message; $('toast').classList.add('show'); clearTimeout(window.toastTimer); window.toastTimer=setTimeout(()=>$('toast').classList.remove('show'),2500); }
-function feedback(id, message='', tone='info') { const element=$(id); element.textContent=message; element.className='inline-feedback'+(message?' '+tone:' hidden'); }
+function feedback(id, message='', tone='info') { const element=$(id); if(element.dataset)delete element.dataset.pollTask; element.textContent=message; element.className='inline-feedback'+(message?' '+tone:' hidden'); }
 function stepState(id, label, tone='') { const element=$(id); element.textContent=label; element.className='step-state'+(tone?' '+tone:''); }
-function switchPage(page) { state.page=page; sessionStorage.setItem('bridgePage',page); for(const name of ['tasks','connections','feishu']) { $(name+'Page').classList.toggle('hidden',page!==name); $('nav'+name[0].toUpperCase()+name.slice(1)).classList.toggle('active',page===name); } $('pageTitle').textContent=({tasks:'任务',connections:'连接',feishu:'飞书',})[page]; $('pageSubtitle').textContent=({tasks:'查看机器人接到的任务与结果。',connections:'管理外部任务来源和工作目录。',feishu:'按账号管理机器人、群和执行工具。'})[page]; $('primaryAction').classList.toggle('hidden',page!=='connections'); if(page==='feishu') renderFeishu();  }
+function switchPage(page) { state.page=page; sessionStorage.setItem('bridgePage',page); for(const name of ['tasks','connections','feishu']) { $(name+'Page').classList.toggle('hidden',page!==name); $('nav'+name[0].toUpperCase()+name.slice(1)).classList.toggle('active',page===name); } $('pageTitle').textContent=({tasks:'任务',connections:'连接',feishu:'飞书',})[page]; $('pageSubtitle').textContent=({tasks:'查看机器人接到的任务与结果。',connections:'管理外部任务来源和工作目录。',feishu:'按账号管理机器人、群和执行工具。'})[page]; $('primaryAction').classList.toggle('hidden',page!=='connections'); $('concurrencyAction').classList.toggle('hidden',page!=='tasks'); if(page==='feishu') renderFeishu();  }
 function taskStatus(t){return t.error_code==='assistant_authorization_required'?'等待协作确认':t.error_code==='group_question_pending'?'等待委托助手答复':t.execution_backend==='claude'&&t.status==='等待 Codex'?'等待 Claude Code':t.display_status||t.status;}
 function conversationAction(t,detail=false){
  const label=detail?(t.execution_backend==='claude'?'在终端打开 Claude 对话':'打开 Codex 对话'):'打开对话';
@@ -29,7 +31,7 @@ function conversationAction(t,detail=false){
  }
  return `<a class="${style}" href="codex://threads/${encodeURIComponent(t.thread_id)}">${label}</a>`;
 }
-function taskRow(t) { return `<div class="task" data-task="${esc(t.id)}"><div class="task-main"><div class="meta-row"><span class="source-chip">${esc(t.source)}</span><span class="arrow">→</span><span>${esc(t.project_name)}</span></div><div class="task-title">${esc(t.archive_name||t.title)}</div></div>${badge(taskStatus(t))}<div class="task-tail"><div class="time">${timeText(t.updated_at)}</div>${conversationAction(t)}</div></div>`; }
+function taskRow(t) { return `<div class="task" data-task="${esc(t.id)}"><div class="task-main"><div class="meta-row"><span class="source-chip task-source-label" title="${esc(t.source_label||t.collaborator_name||t.source)}">${esc(t.source_label||t.collaborator_name||t.source)}</span></div><div class="task-title">${esc(t.archive_name||t.title)}</div></div>${taskBadge(t)}<div class="task-tail"><div class="time">${timeText(t.updated_at)}</div>${conversationAction(t)}</div></div>`; }
 function renderTasks() {
  const tasks=state.tasks; const attention=tasks.filter(t=>['需要你处理','流程受阻','等待审核'].includes(taskStatus(t))); const others=tasks.filter(t=>!attention.includes(t));
  const paired=(state.feishu?.allowed_open_ids||[]).length>0||(state.feishu?.allowed_chat_ids||[]).length>0;
@@ -56,25 +58,32 @@ window.addEventListener('bridge:feishu-connections',e=>{
  state.feishuCatalogReady=true;state.feishuCatalogError='';renderConnections();
 });
 let refreshPromise=null;
+let refreshFailure=null;
+function panelRefreshNotice(error=null,paused=false){
+ const stamp=()=>new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+ if(error){refreshFailure={message:error.message,time:stamp(),count:(refreshFailure?.count||0)+1};}
+ else refreshFailure=null;
+ // One missed poll is noise; only surface the notice after repeated failures, and clear it once refresh recovers.
+ const showFailure=!!error&&refreshFailure.count>=3;
+ $('serviceNotice').classList.toggle('hidden',!paused&&!showFailure);
+ $('serviceNotice').classList.toggle('paused',paused);
+ $('retryRefresh').classList.toggle('hidden',paused||!error);
+ if(paused){$('serviceNoticeText').textContent='Bridge 已暂停。这里仅供查看，列表中的任务状态是暂停前的记录；飞书消息、定时任务和待处理任务都不会继续执行。';}
+ else if(showFailure){$('serviceNoticeText').textContent=`面板数据暂时无法更新（${refreshFailure.time}）：${refreshFailure.message}。已保留上次成功的数据，正在自动重试；这不代表任务执行失败。`;}
+}
 async function refresh(force=false) {
  if(refreshPromise){ if(!force)return refreshPromise; await refreshPromise; }
  const request=(async()=>{
   try {
-   const [runtime,projects,connections,deletedConnections,tasks,feishu]=await Promise.all([api('/healthz'),api('/api/projects'),api('/api/connections'),api('/api/connections/deleted'),api('/api/tasks'),api('/api/feishu')]);
+   const read=async(path,label)=>{try{return await api(path);}catch(e){await new Promise(r=>setTimeout(r,800));try{return await api(path);}catch(e2){throw new Error(label+'：'+e2.message);}}};
+   const [runtime,projects,connections,deletedConnections,tasks,feishu]=await Promise.all([read('/healthz','服务状态'),read('/api/projects','工作目录'),read('/api/connections','连接列表'),read('/api/connections/deleted','已删除连接'),read('/api/tasks?compact=1','任务列表'),read('/api/feishu','飞书设置')]);
    state.projects=projects; state.connections=connections; state.deletedConnections=deletedConnections; state.tasks=tasks; state.feishu=feishu;
    renderTasks(); renderConnections(); if(state.page==='feishu')renderFeishu(); 
-   const paused=runtime.status==='paused';
-   $('serviceNotice').classList.toggle('hidden',!paused);
-   $('serviceNotice').classList.toggle('paused',paused);
-   $('retryRefresh').classList.toggle('hidden',paused);
-   if(paused)$('serviceNoticeText').textContent='Bridge 已暂停。这里仅供查看，列表中的任务状态是暂停前的记录；飞书消息、定时任务和待处理任务都不会继续执行。';
+   panelRefreshNotice(null,runtime.status==='paused');
    if(state.drawer?.kind==='task')await showTask(state.drawer.id,false);
    return true;
   } catch(e) {
-   $('serviceNoticeText').textContent='面板数据暂时无法更新：'+e.message+'。当前内容可能不是最新的。';
-   $('serviceNotice').classList.remove('paused');
-   $('retryRefresh').classList.remove('hidden');
-   $('serviceNotice').classList.remove('hidden');
+   panelRefreshNotice(e);
    return false;
   }
  })();
@@ -194,11 +203,10 @@ function validateFeishuPrompt() {
  const template=$('feishuPrompt').value;
  let error='';
  if(template.split('{{message}}').length!==2)error='模板需恰好包含一次 {{message}}';
- else if(!template.trim()||template.length>8000)error='模板需为 1 到 8000 字';
+ else if(!template.trim())error='模板不能为空';
  const result=error?'':template.replace('{{message}}','请检查今天的项目进度');
  if(!error){
   const bytes=new TextEncoder().encode(JSON.stringify({message:result,request_id:'fs_'+'x'.repeat(48),task_id:'x'.repeat(100)})).length;
-  if(result.length>12000||bytes>16384)error='合成后超过 Bridge 长度限制，请缩短模板或消息。';
  }
  feedback('promptValidation',error,'error');
  $('feishuPrompt').setAttribute('aria-invalid',error?'true':'false');
@@ -222,6 +230,7 @@ async function saveFeishu(e) {
 }
 function openOverlay(kind, heading, html) { if(state.drawer?.kind!==kind)feedback('drawerFeedback'); state.drawer={kind,id:state.drawer?.id}; $('drawerHeading').textContent=heading; setHtmlIfChanged('drawerBody',html); $('overlay').classList.add('show'); $('drawer').classList.add('show'); }
 function closeDrawer(){ $('drawer').classList.remove('show'); state.drawer=null; if(!$('modal').classList.contains('show')) $('overlay').classList.remove('show'); }
+const taskDetailFailures=new Map();
 async function showTask(id,focus=true) {
  if(focus)feedback('drawerFeedback');
  try {
@@ -234,7 +243,17 @@ async function showTask(id,focus=true) {
   const collaboration=(t.collaboration?`<section class="detail-section"><h3>协作任务 · ${esc(t.collaboration.name)}</h3><button class="mini-link" data-task="${esc(t.collaboration.parent_task_id)}">查看委托任务</button><p class="config-help">结果交回委托助手，由最初接待你的助手统一回复。</p></section>`:'')+(t.children?.length?`<section class="detail-section"><h3>分配给其他助手的任务</h3>${t.children.map(c=>`<p><button class="mini-link" data-task="${esc(c.id)}">${esc(c.name)}</button> · ${esc(taskStatus(c))}</p>`).join('')}</section>`:'');
   const html=`<h2 class="detail-title">${esc(t.archive_name||t.title)}</h2><div class="detail-grid"><div class="detail-item"><label>状态</label><strong>${esc(taskStatus(t))}</strong></div><div class="detail-item"><label>执行工具</label><strong>${t.execution_backend==='claude'?'Claude Code CLI':'Codex CLI · GPT'}</strong></div><div class="detail-item"><label>时间</label><strong>${timeText(t.created_at)}</strong></div></div>${t.archived?'<p class="config-help">这是改版前的历史记录，仅供查看。新任务请从飞书发送一条新消息，将按当前 Prompt 执行。</p>':''}${collaboration}<section class="detail-section"><h3>任务回复</h3><div class="result-box" style="white-space:pre-wrap">${esc(t.result||'尚无回复。')}</div><div style="margin-top:12px">${action}</div></section><details class="detail-section"><summary>任务消息记录</summary>${messages}</details>`;
   openOverlay('task','任务详情',html);state.drawer={kind:'task',id};
- }catch(e){toast(e.message);}
+  const prior=taskDetailFailures.get(id);
+  if(prior&&$('drawerFeedback').dataset.pollTask===id){
+   feedback('drawerFeedback','任务详情更新已恢复。上次刷新失败：'+prior,'info');
+  }
+ }catch(e){
+  if(!focus&&state.drawer?.id!==id)return;
+  taskDetailFailures.set(id,e.message);
+  if(focus){openOverlay('task','任务详情','<p class="config-help">任务详情暂不可读，正在自动重试。任务本身不会因此停止。</p>');state.drawer={kind:'task',id};}
+  feedback('drawerFeedback','任务详情暂时无法更新：'+e.message+'。已保留原内容，正在自动重试。','error');
+  $('drawerFeedback').dataset.pollTask=id;
+ }
 }
 function connectionText(c) { return `请通过这个连接发送任务：\n连接：${c.source} → ${c.project_name}\n执行工具：${c.execution_backend==='claude'?'Claude Code CLI':'Codex CLI · GPT'}\n接口：${c.endpoint}\n密钥：${c.api_key}\n\n新任务：POST 接口，Authorization: Bearer <密钥>，Content-Type: application/json，JSON: {"message":"任务内容","request_id":"唯一请求编号"}。\n继续同一个任务：在 JSON 中加上返回的 task_id；每条新消息使用新的 request_id。\n查询状态：GET ${c.endpoint}/<task_id>，使用同一密钥。`; }
 function legacyCopy(text) {
@@ -361,3 +380,21 @@ function renderFeishuOverview() {
   state.feishuDisclosureKey=disclosureKey;
  }
 }
+
+function concurrencyHtml(c){
+ const rows=c.backends.map(b=>`<div class="concurrency-row"><div class="project-info"><strong>${esc(b.name)}</strong><span>正在执行 ${b.active} 个</span></div><div class="concurrency-stepper"><button class="btn" type="button" data-conc-step="-1" data-backend="${esc(b.id)}" aria-label="减少 ${esc(b.name)} 并发">−</button><input class="input" type="number" min="1" max="${c.max}" step="1" id="conc_${esc(b.id)}" value="${b.limit}" aria-label="${esc(b.name)} 最多同时执行"><button class="btn" type="button" data-conc-step="1" data-backend="${esc(b.id)}" aria-label="增加 ${esc(b.name)} 并发">+</button></div></div>`).join('');
+ return `<h2 class="detail-title">并发设置</h2><p class="config-help">每个执行工具最多同时执行多少个任务。超出的任务会显示「等待 …」，有空位后按顺序开始。助手之间的协作子任务另有名额，不占用这里的数量。</p><div class="concurrency-list">${rows}</div><p class="config-help">范围 1–${c.max}。调小不会中断正在执行的任务，只影响之后开始的任务。</p><button class="btn primary" type="button" id="saveConcurrency">保存</button>`;
+}
+async function showConcurrency(){
+ feedback('drawerFeedback');
+ try{const c=await api('/api/concurrency');state.concurrency=c;openOverlay('concurrency','并发设置',concurrencyHtml(c));}catch(e){toast(e.message);}
+}
+async function saveConcurrency(){
+ const c=state.concurrency;if(!c)return;const limits={};
+ for(const b of c.backends){const v=Number($('conc_'+b.id).value);if(!Number.isInteger(v)||v<1||v>c.max)return feedback('drawerFeedback',`${b.name} 的并发数需为 1 到 ${c.max} 之间的整数`,'error');limits[b.id]=v;}
+ const button=$('saveConcurrency');button.disabled=true;feedback('drawerFeedback','正在保存…');
+ try{state.concurrency=await api('/api/concurrency',{method:'POST',body:JSON.stringify({limits})});openOverlay('concurrency','并发设置',concurrencyHtml(state.concurrency));feedback('drawerFeedback','已保存，新的并发数立即生效。','success');}
+ catch(e){feedback('drawerFeedback',e.message,'error');}finally{const b=$('saveConcurrency');if(b)b.disabled=false;}
+}
+$('concurrencyAction').onclick=showConcurrency;
+document.addEventListener('click',e=>{const t=e.target.closest('button');if(!t)return;if(t.id==='saveConcurrency')return saveConcurrency();if(t.dataset.concStep){const input=$('conc_'+t.dataset.backend);const max=state.concurrency?.max||20;input.value=Math.min(max,Math.max(1,(Number(input.value)||1)+Number(t.dataset.concStep)));}});

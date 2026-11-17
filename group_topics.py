@@ -100,7 +100,10 @@ class GroupTopics:
             title=data.get('name') or chat_name(cfg['app_id'],cfg['app_secret'],chat)
             routes[chat]={'chat_id':chat,'name':title or '任务管家 · '+chat[-6:],'chat_title':title,'connection_id':connection,
                           'prompt_template':prompt_for_job(j,credentials,group=True),'enabled':True,'topic_collaboration':True}
-            cfg.update(group_configs=routes,allowed_chat_ids=list(routes));atomic_write(path,cfg)
+            cfg.update(group_configs=routes,allowed_chat_ids=list(routes))
+            from assistant_prompt import sync_shared
+            sync_shared(cfg)
+            atomic_write(path,cfg)
             self.c.onboarding.update(j['id'],phase='ready',message='已接入群聊，群里 @我说要做什么就行。')
             return
 
@@ -130,7 +133,10 @@ class GroupTopics:
                               'chat_title':title,'connection_id':connection,
                               'prompt_template':prompt_for_job(j,credentials,group=True),
                               'enabled':True,'topic_collaboration':topics}
-                cfg.update(group_configs=routes,allowed_chat_ids=list(routes));atomic_write(path,cfg)
+                cfg.update(group_configs=routes,allowed_chat_ids=list(routes))
+                from assistant_prompt import sync_shared
+                sync_shared(cfg)
+                atomic_write(path,cfg)
                 if j.get('phase')=='waiting_group':
                     self.c.onboarding.update(j['id'],phase='ready',message='已接入群聊，群里 @我说要做什么就行。')
                 return {'route':routes[chat]}
@@ -152,6 +158,23 @@ class GroupTopics:
                 updated=load(path)
                 return {'route':next((r for r in group_routes(updated) if r['chat_id']==data['chat_id']),None)}
             return self.activate_assistant(connection,data) or {'route':None}
+
+    def recipient(self, connection, data):
+        """Select one addressed receiver across ordinary and collaborative group routes."""
+        if (not isinstance(data, dict) or set(data) != {'chat_id', 'mentions'}
+                or not isinstance(data['chat_id'], str)
+                or not re.fullmatch(r'oc_[\w-]{1,125}', data['chat_id'])
+                or not isinstance(data['mentions'], list) or len(data['mentions']) > 100
+                or any(not isinstance(m, str) or len(m) > 180 for m in data['mentions'])):
+            raise BridgeError(400, 'invalid_request', '群接收对象无效。')
+        with CONFIG_LOCK:
+            routes = list(self.routes(data['chat_id'], receiving=False))
+            if not any(route['connection_id'] == connection for _, _, route in routes):
+                raise BridgeError(403, 'group_forbidden', '当前连接未接入这个群。')
+            eligible = {cfg['bot_open_id']: route['connection_id']
+                        for _, cfg, route in routes if cfg.get('bot_open_id')}
+            owner = next((eligible[m] for m in data['mentions'] if m in eligible), None)
+            return {'responsible': owner == connection}
 
     def resolve(self,connection,data):
         keys={'chat_id','message_id','parent_id','root_id','mentions','sender_id'}
@@ -175,7 +198,7 @@ class GroupTopics:
                 self.owner_route(found)
                 topic=dict(found)
             else:
-                eligible={v.get('bot_open_id'):r['connection_id'] for _,v,r in self.routes(chat) if v.get('bot_open_id')}
+                eligible={v.get('bot_open_id'):r['connection_id'] for _,v,r in self.routes(chat,receiving=False) if v.get('bot_open_id')}
                 owner=next((eligible[m] for m in mentions if m in eligible),None)
                 if owner!=connection:return {'topic':None,'handled_by_other':bool(owner)}
                 ident='topic_'+hashlib.sha256((chat+':'+mid).encode()).hexdigest()[:32]
@@ -252,9 +275,6 @@ class GroupTopics:
         if old:
             if old['body']!=body:raise BridgeError(409,'request_changed','同一编号不能发送不同讨论内容。')
             return old['id']
-        if key.startswith(('say:','question:','answer:')):
-            count=db.execute("SELECT COUNT(*) FROM group_discussions WHERE task_id=? AND (event_key LIKE 'say:%' OR event_key LIKE 'question:%' OR event_key LIKE 'answer:%')",(task,)).fetchone()[0]
-            if count>=LIMIT:raise BridgeError(409,'discussion_limit','此任务的讨论消息已达上限，请汇总后结束。')
         ident='discussion_'+uuid.uuid4().hex
         db.execute('INSERT INTO group_discussions(id,topic_id,task_id,actor_id,event_key,body,created_at) VALUES (?,?,?,?,?,?,?)',(ident,topic['id'],task,actor,key,body,time.time()))
         return ident
@@ -384,7 +404,7 @@ class GroupTopics:
     def start(self):
         def run():
             while not self.stop.is_set():
-                try:self.reconcile();self.deliver()
+                try:self.reconcile();self.deliver();self.c.mentions.deliver()
                 except Exception:LOG.exception('Group topic reconciliation failed')
                 self.stop.wait(3)
         self.thread=threading.Thread(target=run,daemon=True);self.thread.start()

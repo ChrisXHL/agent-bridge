@@ -187,7 +187,7 @@ class AssistantTests(unittest.TestCase):
   out=self.manager.public(self.manager.read(j['id']));self.assertEqual(out['phase'],'failed');self.assertIn('审批',out['message'])
   self.assertTrue((self.manager.directory(j['id'])/'credentials.json').exists());self.assertEqual((self.root/'feishu.json').read_bytes(),self.old)
  def test_unknown_fields_and_oversized_requirements_rejected(self):
-  for extra in [{'app_secret':'no'},{'requirements':'x'*2001},{'audience':'everyone'},{'request_id':'../x'}]:
+  for extra in [{'app_secret':'no'},{'requirements':'x'*50001},{'audience':'everyone'},{'request_id':'../x'}]:
    with self.assertRaises(BridgeError):self.start(**extra)
  def test_group_creation_waits_for_invitation_without_pairing_code(self):
   j=self.prepare(audience='group');self.finish(j)

@@ -19,7 +19,12 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
+
+
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    # Default backlog (5) is smaller than one panel refresh burst (6 parallel requests).
+    request_queue_size = 128
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -38,11 +43,14 @@ from assistant_collaboration import AssistantCollaboration, install as install_c
 LOG = logging.getLogger("codex_bridge")
 ROOT = Path(__file__).resolve().parent
 STATUSES = {"等待 Codex", "执行中", "需要你处理", "已完成", "失败", "已停止"}
-MAX_BODY = 16 * 1024
+MAX_BODY = 8 * 1024 * 1024
 CODEX_APPROVAL_POLICY = "never"
 CODEX_SANDBOX_MODE = "danger-full-access"
 CODEX_REASONING_EFFORT = "medium"
-MAX_ACTIVE_TASKS = 10
+MAX_ACTIVE_TASKS = int(os.getenv("BRIDGE_MAX_ACTIVE_TASKS", "10"))
+MAX_CONCURRENCY = 20
+BACKENDS = ('codex', 'claude')
+BACKEND_NAMES = {'codex': 'Codex', 'claude': 'Claude Code'}
 TARGET_NOFILE_LIMIT = 4096
 
 
@@ -407,8 +415,9 @@ class Store:
         key = "cb_" + secrets.token_urlsafe(36)
         t = now()
         with self.db() as db:
-            db.execute("INSERT INTO connections (id,source,project_id,api_key,api_key_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                       (cid, source.strip(), project_id, key, digest(key), "待验证", t, t))
+            db.execute("INSERT INTO connections (id,source,project_id,api_key,api_key_hash,status,created_at,updated_at,execution_backend) VALUES (?,?,?,?,?,?,?,?,?)",
+                       (cid, source.strip(), project_id, key, digest(key), "待验证", t, t,
+                        "claude" if os.getenv("BRIDGE_BACKEND", "codex").strip().lower() == "claude" else "codex"))
         return self.connection(cid, reveal=True)
 
     def connection(self, cid, reveal=False):
@@ -560,9 +569,11 @@ class Store:
             first = {r["task_id"]:r["content"] for r in db.execute("SELECT task_id,content FROM messages ORDER BY created_at DESC")}
         names = {p["id"]:p["name"] for p in self.projects()}
         archived = self.history.tasks()
-        return [{**dict(r), **archived.get(r["id"], {}), "title": ("协作 · "+r["collaborator_name"]) if r["collaborator_name"] else first.get(r["id"], ""), "project_name": names.get(r["project_id"], r["project_id"])} for r in rows]
+        from task_labels import labels
+        source_labels = labels(self)
+        return [{**dict(r), **source_labels.get(r['id'], {}), **archived.get(r["id"], {}), "title": ("协作 · "+r["collaborator_name"]) if r["collaborator_name"] else first.get(r["id"], ""), "project_name": names.get(r["project_id"], r["project_id"])} for r in rows]
 
-    def task(self, task_id, connection_id=None):
+    def task(self, task_id, connection_id=None, include_source=False):
         with self.db() as db:
             if connection_id:
                 row = db.execute("SELECT t.*,c.source,c.project_id FROM tasks t JOIN connections c ON c.id=t.connection_id WHERE t.id=? AND t.connection_id=?", (task_id, connection_id)).fetchone()
@@ -581,6 +592,9 @@ class Store:
         obj["approval"] = dict(approval) if approval and approval["state"] == "pending" else None
         obj["title"] = ("协作 · "+parent["target_name"]) if parent else (messages[0]["content"] if messages else "")
         obj["project_name"] = next((p["name"] for p in self.projects() if p["id"] == obj["project_id"]), obj["project_id"])
+        if include_source:
+            from task_labels import labels
+            obj.update(labels(self).get(task_id, {}))
         return obj
 
     def add_approval(self, thread_id, method, detail):
@@ -838,15 +852,63 @@ class Engine:
                 if release:
                     release()
 
+    @staticmethod
+    def _active_rows(db):
+        # An unresolved delivery receipt is not a running turn. Preserve
+        # the record; actual Codex approvals still reserve their slot.
+        return db.execute("""SELECT id, COALESCE(execution_backend,'codex') AS backend,
+            COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=tasks.id),0) AS depth
+            FROM tasks WHERE status IN ('执行中','需要你处理')
+            AND NOT (status='需要你处理' AND COALESCE(error_code,'') IN ('delivery_uncertain','assistant_authorization_required','group_question_pending')
+                AND NOT EXISTS (SELECT 1 FROM approvals WHERE task_id=tasks.id AND state='pending'))""").fetchall()
+
+    def _limits(self, db):
+        limits={b:self.max_active for b in BACKENDS}
+        row=db.execute("SELECT value FROM settings WHERE key='concurrency_limits'").fetchone()
+        try:saved=json.loads(row[0]) if row else {}
+        except ValueError:saved={}
+        for b in BACKENDS:
+            value=saved.get(b) if isinstance(saved,dict) else None
+            if isinstance(value,int) and not isinstance(value,bool) and 1<=value<=MAX_CONCURRENCY:limits[b]=value
+        return limits
+
+    def concurrency(self):
+        with self.store.db() as db:
+            limits=self._limits(db)
+            active={b:0 for b in BACKENDS}
+            for r in self._active_rows(db):
+                if r['id'] not in self.archived_tasks and not r['depth']:
+                    b=r['backend'] if r['backend'] in BACKENDS else 'codex'
+                    active[b]+=1
+        return {'backends':[{'id':b,'name':BACKEND_NAMES[b],'limit':limits[b],'active':active[b]} for b in BACKENDS],
+                'max':MAX_CONCURRENCY,'default':self.max_active}
+
+    def set_concurrency(self, data):
+        if not isinstance(data,dict) or not isinstance(data.get('limits'),dict) or set(data)!={'limits'}:
+            raise BridgeError(400,'invalid_request','无效字段')
+        incoming=data['limits']
+        if set(incoming)-set(BACKENDS):
+            raise BridgeError(400,'invalid_backend','执行工具无效')
+        for value in incoming.values():
+            if not isinstance(value,int) or isinstance(value,bool) or not 1<=value<=MAX_CONCURRENCY:
+                raise BridgeError(400,'invalid_limit',f'并发数需为 1 到 {MAX_CONCURRENCY} 之间的整数')
+        with self.store.db() as db:
+            limits=self._limits(db);limits.update(incoming)
+            db.execute("INSERT INTO settings(key,value) VALUES ('concurrency_limits',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(limits),))
+        LOG.info('concurrency limits updated %s',limits)
+        return self.concurrency()
+
     def _deliver_one(self):
         with self.store.db() as db:
             # An unresolved delivery receipt is not a running turn. Preserve
             # the record; actual Codex approvals still reserve their slot.
-            active_rows=db.execute("""SELECT id, COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=tasks.id),0) AS depth
-                FROM tasks WHERE status IN ('执行中','需要你处理')
-                AND NOT (status='需要你处理' AND COALESCE(error_code,'') IN ('delivery_uncertain','assistant_authorization_required','group_question_pending')
-                    AND NOT EXISTS (SELECT 1 FROM approvals WHERE task_id=tasks.id AND state='pending'))""").fetchall()
-            active_by_depth={depth:sum(r['id'] not in self.archived_tasks and r['depth']==depth for r in active_rows) for depth in range(4)}
+            active_rows=self._active_rows(db)
+            active_by_depth={depth:sum(r['id'] not in self.archived_tasks and r['depth']==depth for r in active_rows) for depth in range(1,4)}
+            active_by_backend={}
+            for r in active_rows:
+                if r['id'] not in self.archived_tasks and not r['depth']:
+                    b=r['backend'] if r['backend'] in BACKENDS else 'codex';active_by_backend[b]=active_by_backend.get(b,0)+1
+            limits=self._limits(db)
             rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,t.execution_backend,c.project_id,
                 COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=t.id),0) AS depth
                 FROM messages m JOIN tasks t ON t.id=m.task_id JOIN connections c ON c.id=t.connection_id
@@ -859,7 +921,11 @@ class Engine:
             if row['execution_backend'] == 'codex' and not self._codex_desktop_open():
                 continue
             if self.collaboration and not self.collaboration.may_deliver(dict(row)):continue
-            if active_by_depth.get(row['depth'],0)>=(CHILD_SLOTS if row['depth'] else self.max_active):continue
+            if row['depth']:
+                if active_by_depth.get(row['depth'],0)>=CHILD_SLOTS:continue
+            else:
+                backend=row['execution_backend'] if row['execution_backend'] in BACKENDS else 'codex'
+                if active_by_backend.get(backend,0)>=limits[backend]:continue
             if self._deliver_message(dict(row)):
                 return
 
@@ -1002,6 +1068,9 @@ class Engine:
 def make_handler(store, engine, base_url, allowed_host=None,
                  feishu_settings_path=None, feishu_supervisor=None, feishu_inbox_path=None):
     static = ROOT / "static"
+    if feishu_settings_path and feishu_inbox_path:
+        store.feishu_label_config = Path(feishu_settings_path)
+        store.feishu_label_inbox = Path(feishu_inbox_path)
     group_settings = GroupSettings(feishu_settings_path, feishu_inbox_path, store, feishu_supervisor) if feishu_settings_path and feishu_inbox_path else None
     onboarding = AssistantOnboarding(group_settings) if group_settings else None
     manager = AssistantManager(onboarding) if onboarding else None
@@ -1072,12 +1141,17 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403,'local_only','安装信息只能在本机查看')
                     from bridge_setup import VERSION
                     return self.send_json(200,{'product':'codex-bridge','version':VERSION,
-                        'source_root':str(ROOT.resolve()),'state_dir':str(Path(store.db_path).resolve().parent)})
+                        'source_root':str(ROOT.resolve()),'state_dir':str(Path(store.db_path).resolve().parent),
+                        'features':['signed-assistant-source-v1','group-recipient-v1','scheduled-group-handoff-v1','native-group-mention-v1','personal-preferences-v1','task-source-label-v1']})
                 if path.startswith("/api/feishu") and self.command in ("GET", "PATCH", "POST"):
                     if allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1"):
                         raise BridgeError(403, "local_only", "飞书设置只能在本机修改")
                     if feishu_settings_path is None:
                         raise BridgeError(503, "feishu_unavailable", "飞书设置未启用")
+                    if path == '/api/feishu/personal-preferences' and self.command == 'POST':
+                        if not group_settings:raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
+                        from personal_preferences import manage as manage_preferences
+                        return self.send_json(200,manage_preferences(group_settings,self.read_json()))
                     if path == '/api/feishu/assistant-self-update' and self.command == 'POST':
                         if not group_settings:raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
                         from assistant_self_update import update as update_assistant_self
@@ -1116,7 +1190,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         return self.send_json(200, onboarding.dispatch(path,self.command,data))
                     if path in ('/api/feishu/catalog','/api/feishu/accounts','/api/feishu/accounts/remove','/api/feishu/accounts/restore','/api/feishu/apps','/api/feishu/apps/backend','/api/feishu/apps/enabled','/api/feishu/groups','/api/feishu/app-pairing','/api/feishu/group-defaults','/api/feishu/migration/export','/api/feishu/migration/import','/api/feishu/migration/stop','/api/feishu/assistant-template/export','/api/feishu/assistant-template/apply'):
                         if not group_settings: raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
-                        data = self.read_json(limit=1024*1024 if path.startswith(('/api/feishu/migration/', '/api/feishu/assistant-template/')) else 128*1024) if self.command == 'POST' else None
+                        data = self.read_json() if self.command == 'POST' else None
                         return self.send_json(200, group_settings.dispatch(path,self.command,data))
                     if path == "/api/feishu" and self.command == "PATCH":
                         save_feishu_settings(feishu_settings_path, self.read_json(), store)
@@ -1256,8 +1330,18 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         return self.send_json(200, obj)
                     if self.command == "PATCH":
                         return self.send_json(200, store.update_connection(cid, self.read_json()))
+                if path == "/api/concurrency" and self.command in ("GET", "POST"):
+                    if engine is None:
+                        raise BridgeError(503, "engine_unavailable", "任务调度暂不可用")
+                    if self.command == "GET":
+                        return self.send_json(200, engine.concurrency())
+                    return self.send_json(200, engine.set_concurrency(self.read_json()))
                 if path == "/api/tasks" and self.command == "GET":
-                    return self.send_json(200, store.tasks())
+                    tasks = store.tasks()
+                    if "compact=1" in (urlsplit(self.path).query or ""):
+                        # Panel polls every few seconds; the list only needs a short title.
+                        tasks = [{**t, "title": (t.get("title") or "")[:200], "result": None} for t in tasks]
+                    return self.send_json(200, tasks)
                 if path.startswith("/api/tasks/") and path.endswith("/open-conversation") and self.command == "POST":
                     if (allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1")
                             or self.headers.get("Origin") != base_url):
@@ -1266,7 +1350,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(400, "invalid_request", "打开对话的请求无效")
                     return self.send_json(200, open_claude_task_conversation(store, path.split("/")[-2]))
                 if path.startswith("/api/tasks/") and self.command == "GET":
-                    return self.send_json(200, store.task(path.rsplit("/", 1)[-1]))
+                    return self.send_json(200, store.task(path.rsplit("/", 1)[-1], include_source=True))
                 if path.startswith("/api/tasks/") and self.command == "PATCH":
                     if path.rsplit("/", 1)[-1] in store.history.tasks():
                         raise BridgeError(409, "historical_task", "历史任务仅供查看")
@@ -1284,6 +1368,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403,'local_only','群话题只允许本机接收器')
                     if self.headers.get('Origin') and self.headers['Origin']!=base_url:raise BridgeError(403,'origin_forbidden','来源无效')
                     connection=store.authenticate(self.headers.get('Authorization',''))
+                    if path=='/v1/group-topics/recipient' and self.command=='POST':return self.send_json(200,collaboration.topics.recipient(connection['id'],self.read_json()))
                     if path=='/v1/group-topics/join' and self.command=='POST':return self.send_json(200,collaboration.topics.join(connection['id'],self.read_json()))
                     if path=='/v1/group-topics/resolve' and self.command=='POST':return self.send_json(200,collaboration.topics.resolve(connection['id'],self.read_json()))
                     if path=='/v1/group-topics/alias' and self.command=='POST':return self.send_json(200,collaboration.topics.alias(connection['id'],self.read_json()))
@@ -1293,19 +1378,20 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         return self.send_json(status,result)
                     if self.command=='GET':return self.send_json(200,collaboration.topics.get(connection['id'],path.rsplit('/',1)[-1]))
                     raise BridgeError(405,'method_not_allowed','操作不支持')
-                if path in ('/v1/assistant-peers','/v1/assistant-calls','/v1/assistant-discussions','/v1/assistant-questions','/v1/assistant-answers') or path.startswith(('/v1/assistant-calls/','/v1/assistant-questions/')):
+                if path in ('/v1/assistant-peers','/v1/assistant-calls','/v1/assistant-mentions','/v1/assistant-discussions','/v1/assistant-questions','/v1/assistant-answers') or path.startswith(('/v1/assistant-calls/','/v1/assistant-questions/')):
                     if not collaboration or allowed_host is not None or self.client_address[0] not in ('127.0.0.1','::1'):
                         raise BridgeError(403,'local_only','协作调用只允许本机任务')
                     origin=self.headers.get('Origin')
                     if origin and origin!=base_url:raise BridgeError(403,'origin_forbidden','来源无效')
                     session=collaboration.authenticate(self.headers.get('Authorization',''))
+                    if path=='/v1/assistant-mentions' and self.command=='POST':return self.send_json(202,collaboration.mentions.send(session,self.read_json()))
                     if path=='/v1/assistant-discussions' and self.command=='POST':return self.send_json(202,collaboration.topics.say(session,self.read_json()))
                     if path=='/v1/assistant-questions' and self.command=='POST':return self.send_json(202,collaboration.topics.ask(session,self.read_json()))
                     if path=='/v1/assistant-questions' and self.command=='GET':return self.send_json(200,{'questions':collaboration.topics.questions(session)})
                     if path.startswith('/v1/assistant-questions/') and self.command=='GET':return self.send_json(200,collaboration.topics.question(session,path.rsplit('/',1)[-1]))
                     if path=='/v1/assistant-answers' and self.command=='POST':return self.send_json(200,collaboration.topics.answer(session,self.read_json()))
                     if path=='/v1/assistant-peers' and self.command=='GET':return self.send_json(200,{'assistants':collaboration.peers_for(session['assistant_id'],session['task_id'])})
-                    if path=='/v1/assistant-calls' and self.command=='POST':return self.send_json(202,collaboration.call(session,self.read_json(limit=64*1024)))
+                    if path=='/v1/assistant-calls' and self.command=='POST':return self.send_json(202,collaboration.call(session,self.read_json()))
                     if path.startswith('/v1/assistant-calls/') and self.command=='GET':return self.send_json(200,collaboration.result(session,path.rsplit('/',1)[-1]))
                     raise BridgeError(405,'method_not_allowed','操作不支持')
                 if path == "/v1/tasks" and self.command == "POST":

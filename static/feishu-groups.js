@@ -45,9 +45,9 @@
   const choose=project=>{
    node(selectId).innerHTML=projectOptions(project.id);
    node(selectId).value=project.id;
-   if(prefix==='group')vm.groupDirty=true;else vm.appDirty=true;
+   if(prefix==='group')vm.groupDirty=true;else if(prefix==='application')vm.appDirty=true;
    showPath();
-   report(feedbackId,`已选中「${project.name}」，点击保存后用于新任务。`);
+   report(feedbackId,prefix==='existing'?`已选中「${project.name}」，点击“连接这位机器人”后使用。`:`已选中「${project.name}」，点击保存后用于新任务。`);
   };
   node(selectId).addEventListener('change',showPath);showPath();
   node(prefix+'PickFolder').onclick=()=>operation(async()=>{
@@ -104,27 +104,45 @@
   node('appCount').textContent=`（${vm.catalog.apps.length}）`;
  }
  async function fillGroupPurpose(g){const ref=g.app_ref;try{const defaults=await api('/api/feishu/group-defaults',{method:'POST',body:JSON.stringify({app_ref:ref})});if(vm.group===g&&g.app_ref===ref&&!vm.promptDirty){node('groupPrompt').value=defaults.prompt_template;validateGroup();}}catch(e){if(vm.group===g)report('groupFeedback',e.message,true);}}
- async function refreshCatalog(){try{vm.catalog=await api('/api/feishu/catalog');area.classList.remove('hidden');node('feishuPage').classList.add('multi-groups');lists();pairView();}catch(e){window.dispatchEvent(new CustomEvent('bridge:feishu-connections',{detail:{error:e.message}}));report('groupsNotice',e.message,true);}}
+ let catalogPromise=null, catalogError='';
+ function refreshCatalog(){
+  if(catalogPromise)return catalogPromise;
+  catalogPromise=(async()=>{
+   try{
+    vm.catalog=await api('/api/feishu/catalog');
+    area.classList.remove('hidden');node('feishuPage').classList.add('multi-groups');lists();pairView();
+    // Clear only our recovered refresh error, not feedback from another action.
+    if(catalogError&&node('groupsNotice').textContent===catalogError)report('groupsNotice');
+    catalogError='';
+   }catch(e){
+    catalogError=e.message;
+    window.dispatchEvent(new CustomEvent('bridge:feishu-connections',{detail:{error:catalogError}}));
+    report('groupsNotice',catalogError,true);
+   }
+  })().finally(()=>{catalogPromise=null;});
+  return catalogPromise;
+ }
  async function operation(fn){if(vm.busy)return;vm.busy=true;area.querySelectorAll('button').forEach(b=>b.disabled=true);try{await fn();}finally{vm.busy=false;area.querySelectorAll('button').forEach(b=>b.disabled=false);validateGroup();validateApp();}}
  function view(which){node('groupList').classList.toggle('hidden',!!which);node('bridgeCli').classList.toggle('hidden',!!which);node('migrationPanel').classList.toggle('hidden',which!=='migration');node('groupEditor').classList.toggle('hidden',which!=='group');node('applicationEditor').classList.toggle('hidden',which!=='app');node('existingLink').classList.toggle('hidden',which!=='link');node('botSearch').classList.toggle('hidden',!!which);node('openMigration').classList.toggle('hidden',!!which);node('addGroup').classList.toggle('hidden',!!which);node('addApplication').classList.toggle('hidden',!!which);node('addApplicationManual').classList.toggle('hidden',!!which);}
  function leave(){if((vm.groupDirty||vm.appDirty)&&!confirm('有未保存的修改，确定放弃？'))return;vm.group=null;vm.app=null;vm.groupDirty=false;vm.appDirty=false;view(null);}
- function groupEditor(group){
-  vm.group=group?{...group,existing:true}:{app_ref:vm.catalog.apps[0]?.ref||'',chat_id:'',name:'',project_id:'',prompt_template:'飞书任务：{{message}}\n\n请执行任务，并说明结果。',enabled:true,topic_collaboration:true,existing:false};
+ function groupEditor(group,selectedRef=null){
+  vm.group=group?{...group,existing:true}:{app_ref:selectedRef||vm.catalog.apps[0]?.ref||'',chat_id:'',name:'',project_id:'',prompt_template:'飞书任务：{{message}}\n\n请执行任务，并说明结果。',enabled:true,topic_collaboration:true,existing:false};
   const g=vm.group,a=app(g.app_ref);g.revision=a?.revision;
-  if(!group){g.project_id=state.connections.find(c=>c.id===a?.connection_id)?.project_id||'';}
+   const shared=a?.prompt_policy_version===1;
+  if(!group){g.project_id=state.connections.find(c=>c.id===a?.connection_id)?.project_id||'';if(shared)g.prompt_template=a.prompt_template;}
   vm.groupDirty=false;vm.promptDirty=false;view('group');node('groupEditor').innerHTML=`<button class="mini-link group-back" id="groupBack">← 返回群配置</button><h2>${g.existing?'编辑群配置':'添加群配置'}</h2><form id="groupForm">
   <div class="field"><label for="groupName">群名称</label><input class="input" id="groupName" maxlength="60" value="${safe(g.name)}" placeholder="${g.existing?'例如：翻译群':'保存时自动读取，也可以自己填写'}" ${g.existing?'required':''}></div>
   <div class="field"><label for="groupApplication">飞书应用</label><select class="input" id="groupApplication" ${g.existing?'disabled':''} required>${applicationOptions(g.app_ref)}</select>${g.existing?'':'<button class="mini-link new-app-link" type="button" id="newAppFromGroup">使用其他应用？添加应用</button>'}</div>
   <div id="groupPairing"></div>
   <div class="field"><label for="groupProject">本群工作文件夹</label><select class="input" id="groupProject" required>${projectOptions(g.project_id)}</select>${folderField('group')}<p class="config-help">只影响这个群的新任务；其他群和机器人私聊继续使用各自的文件夹。</p></div>
-  <div class="field"><label for="groupPrompt">本群 Prompt</label><textarea class="input" id="groupPrompt" rows="10" spellcheck="false" aria-describedby="groupPromptHelp groupFeedback">${safe(g.prompt_template)}</textarea><p class="config-help" id="groupPromptHelp">保留一个 <code>{{message}}</code>，自动填入本群消息。保存只影响新任务。群成员也可以在群里 @助手，直接说明以后在本群怎么做；不会修改其他群或私聊。</p>${g.self_update_rule?`<details class="connection-details"><summary>在群里更新的规则</summary><p style="white-space:pre-wrap">${safe(g.self_update_rule)}</p></details>`:''}</div>
+  <div class="field"><label for="groupPrompt">${shared?'助手共享业务 Prompt':'本群 Prompt（旧版独立配置）'}</label><textarea class="input" id="groupPrompt" rows="10" spellcheck="false" aria-describedby="groupPromptHelp groupFeedback">${safe(g.prompt_template)}</textarea><p class="config-help" id="groupPromptHelp">保留一个 <code>{{message}}</code>，自动填入当前消息。${shared?'这位助手的全部群聊和私聊共用此业务 Prompt；保存影响之后的新消息，不改历史任务。创建者可在群聊或私聊更新共享规则；普通成员只能提出本次任务要求。授权、上下文和交付对象仍按当前会话隔离。':'旧版配置只影响本群新任务，不修改其他群或私聊。迁移到共享架构前，保留原有差异。'}</p>${g.self_update_rule?`<details class="connection-details"><summary>${shared?'共享追加规则':'在群里更新的规则'}</summary><p style="white-space:pre-wrap">${safe(g.self_update_rule)}</p></details>`:''}</div>
   ${vm.catalog.capabilities?.group_topics?`<details class="connection-details"><summary>群聊高级设置</summary><label class="check-label"><input type="checkbox" id="groupTopics" ${g.topic_collaboration?'checked':''}> 允许群内继续讨论和助手协作</label><p class="config-help">开启后，@ 助手发起任务，群成员可回复相关消息继续讨论，已接入本群的助手可分工。关闭后仍可 @ 助手发起任务。保存时会检查群消息权限。</p></details>`:''}
   <label class="check-label"><input type="checkbox" id="groupEnabled" ${g.enabled?'checked':''}> 启用这个群的消息接收</label>
-  <div class="group-save-row"><button class="btn primary" id="saveGroup" type="submit">${g.existing?'保存本群设置':'确认添加这个群'}</button><span>不会修改其他群或历史任务</span></div><div id="groupFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div></form>`;
+  <div class="group-save-row"><button class="btn primary" id="saveGroup" type="submit">${g.existing?'保存本群设置':'确认添加这个群'}</button><span>${shared?'业务 Prompt 全会话共享；群接收与文件夹仍独立':'不会修改其他群或历史任务'}</span></div><div id="groupFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div></form>`;
   node('groupBack').onclick=leave;
   bindFolderField('group','groupProject','groupFeedback');
   node('groupForm').oninput=e=>{vm.groupDirty=true;if(e.target.id==='groupPrompt')vm.promptDirty=true;report('groupFeedback');validateGroup();};
-  node('groupApplication').onchange=()=>{g.app_ref=node('groupApplication').value;g.chat_id='';g.revision=app(g.app_ref)?.revision;const selected=app(g.app_ref);node('groupProject').value=state.connections.find(c=>c.id===selected?.connection_id)?.project_id||'';if(vm.catalog.capabilities?.group_topics)fillGroupPurpose(g);pairView();validateGroup();};
+  node('groupApplication').onchange=()=>groupEditor(null,node('groupApplication').value);
   if(!g.existing&&vm.catalog.capabilities?.group_topics)fillGroupPurpose(g);
   if(node('newAppFromGroup'))node('newAppFromGroup').onclick=()=>applicationEditor(null,true);
   node('groupForm').onsubmit=e=>{e.preventDefault();if(!validateGroup())return;operation(async()=>{try{
@@ -153,7 +171,7 @@
   const action=kind=>operation(async()=>{try{vm.catalog=await api('/api/feishu/app-pairing',{method:'POST',body:JSON.stringify({app_ref:g.app_ref,action:kind})});g.revision=app(g.app_ref)?.revision;lists();pairView();}catch(e){report('groupFeedback',e.message,true);}});
   if(node('groupPair'))node('groupPair').onclick=()=>action('start');if(node('groupCheck'))node('groupCheck').onclick=()=>action('check');validateGroup();
  }
- function validateGroup(){if(!vm.group||!node('saveGroup'))return false;const v=node('groupPrompt').value;const valid=v.trim()&&v.length<=8000&&v.split('{{message}}').length===2;node('groupPrompt').setAttribute('aria-invalid',String(!valid));const ready=!!(valid&&(!vm.group.existing||node('groupName').value.trim())&&node('groupProject').value&&vm.group.chat_id&&vm.group.app_ref);node('saveGroup').disabled=vm.busy||!ready;if(!valid)report('groupFeedback','Prompt 需为 1 到 8000 字，且恰好保留一个 {{message}}。',true);return ready;}
+ function validateGroup(){if(!vm.group||!node('saveGroup'))return false;const v=node('groupPrompt').value;const valid=v.trim()&&v.split('{{message}}').length===2;node('groupPrompt').setAttribute('aria-invalid',String(!valid));const ready=!!(valid&&(!vm.group.existing||node('groupName').value.trim())&&node('groupProject').value&&vm.group.chat_id&&vm.group.app_ref);node('saveGroup').disabled=vm.busy||!ready;if(!valid)report('groupFeedback','Prompt 不能为空，且恰好保留一个 {{message}}。',true);return ready;}
  function renderExistingJob(j){
   const target=node('existingLinkProgress');if(!target)return;
   if(j.phase==='already_connected'){target.innerHTML=`<p>「${safe(j.name)}」已经接入 Bridge，原连接和处理规则保持不变。</p>`;return;}
@@ -179,9 +197,10 @@
    node('existingLink').innerHTML=`<button class="mini-link group-back" id="existingLinkBack">← 返回飞书账号</button><h2>接入飞书已有机器人</h2><p class="config-help">选择已经创建的飞书应用，授权它连接 Bridge。不会新建飞书应用或助手。</p>
    <form id="existingLinkForm"><div class="field"><label for="existingAppChoice">已有飞书应用</label><select class="input" id="existingAppChoice"><option value="">${available.length?'选择本机已保存的应用':'本机还没有未接入的应用'}</option>${available.map(x=>`<option value="${safe(x.app_id)}">${safe(x.profile)} · ${safe(x.app_id)}</option>`).join('')}</select><p class="config-help">列表来自本机飞书工具。找不到时，在下方填写已有应用的 App ID。</p></div>
    <div class="field"><label for="existingAppId">其他已有应用的 App ID（可选）</label><input class="input" id="existingAppId" placeholder="cli_…" autocomplete="off"><p class="config-help">填写后只会打开这个应用的授权页，不能创建新应用。</p></div>
-   <div class="field"><label for="existingProject">交给哪个已有助手或项目处理</label><select class="input" id="existingProject" required>${projectOptions('')}</select><p class="config-help">Bridge 会把新消息交给这里，不会新建助手或项目。飞书里原有的业务规则不会自动复制到 Bridge。</p></div>
+   <div class="field"><label for="existingProject">工作文件夹</label><select class="input" id="existingProject" required>${projectOptions('')}</select>${folderField('existing')}<p class="config-help">可以选择已登记的文件夹，或从本机选择其他文件夹。Bridge 会把这位机器人的新任务交给该文件夹；飞书里原有的业务规则不会自动复制到 Bridge。</p></div>
    <div class="group-save-row"><button class="btn primary" type="submit">连接这位机器人</button></div><div id="existingLinkFeedback" class="inline-feedback hidden" role="status"></div></form><div id="existingLinkProgress" aria-live="polite"></div>`;
    node('existingLinkBack').onclick=leave;
+   bindFolderField('existing','existingProject','existingLinkFeedback');
    node('existingLinkForm').onsubmit=async e=>{e.preventDefault();if(vm.busy)return;
     const app_id=(node('existingAppId').value.trim()||node('existingAppChoice').value),project_id=node('existingProject').value;
     if(!/^cli_[a-z0-9]{16}$/.test(app_id)||!project_id){report('existingLinkFeedback','请选择已有应用和运行项目。',true);return;}
@@ -196,8 +215,9 @@
   }catch(e){node('existingLink').innerHTML=`<button class="mini-link group-back" id="existingLinkBack">← 返回飞书账号</button><p class="inline-feedback error">${safe(e.message)}</p>`;node('existingLinkBack').onclick=leave;}
  }
  function applicationEditor(existing,fromGroup=false){
-  const a=existing||{name:'',app_id:'',prompt_template:'飞书任务：{{message}}\n\n请执行任务，并说明结果。',allowed_open_ids:[],enabled:false};vm.app={...a,fromGroup};vm.appDirty=false;view('app');
-  const project=a.project_id||state.connections.find(c=>c.id===a.connection_id)?.project_id||state.projects[0]?.id||'';
+  const a=existing||{name:'',app_id:'',prompt_policy_version:1,prompt_template:'飞书任务：{{message}}\n\n请执行任务，并说明结果。',allowed_open_ids:[],enabled:false};vm.app={...a,fromGroup};vm.appDirty=false;view('app');
+  const shared=a.prompt_policy_version===1;
+   const project=a.project_id||state.connections.find(c=>c.id===a.connection_id)?.project_id||state.projects[0]?.id||'';
   node('applicationEditor').innerHTML=`<button class="mini-link group-back" id="appBack">← ${fromGroup?'返回群配置编辑':'返回群配置'}</button><h2>${a.ref?'机器人设置':'接入飞书机器人'}</h2><p class="config-help">同一机器人用于多个群时，直接选择已有机器人，无需重复填写凭据。</p><form id="applicationForm">
   <div class="field"><label for="appLabel">应用名称</label><input class="input" id="appLabel" maxlength="60" value="${safe(a.name)}" placeholder="例如：公司 A 工作助手" required></div>
   <div class="field"><label for="applicationId">App ID</label><input class="input" id="applicationId" value="${safe(a.app_id)}" ${a.ref?'readonly':''} placeholder="cli_…" required></div>
@@ -205,7 +225,7 @@
   <div class="field"><label for="applicationSecret">App Secret</label><input class="input" type="password" autocomplete="new-password" id="applicationSecret" placeholder="${a.has_secret?'留空保留已有密钥':'从飞书开发者后台复制'}" ${a.has_secret?'':'required'}></div>
   ${a.ref?`<label class="check-label"><input type="checkbox" id="applicationEnabled" ${a.enabled?'checked':''}> 启用本应用的消息接收（影响本应用全部群）</label>`:''}
   <div class="field"><label for="applicationProject">机器人工作文件夹</label><select class="input" id="applicationProject" required>${projectOptions(project)}</select>${folderField('application')}<p class="config-help">用于这个机器人的私聊及新群默认值。已有群使用各自设置的文件夹。</p></div>
-  <details class="private-settings"><summary>私聊设置（可选）</summary><p class="config-help">默认只接收已添加的群。需要私聊使用时，再添加允许的用户和 Prompt。</p><div class="field"><label for="applicationUsers">允许私聊的用户 Open ID</label><textarea class="input" id="applicationUsers" rows="2" placeholder="每行一个 ou_…；留空则不接收私聊">${safe(a.allowed_open_ids.join('\n'))}</textarea></div><div class="field"><label for="applicationPrompt">私聊 Prompt</label><textarea class="input" id="applicationPrompt" rows="5">${safe(a.prompt_template)}</textarea><p class="config-help">保留一个 {{message}}。创建者也可以私聊助手，直接说明以后怎么做；会影响这位助手的全部新任务。</p>${a.self_update_rule?`<details class="connection-details"><summary>在对话中更新的规则</summary><p style="white-space:pre-wrap">${safe(a.self_update_rule)}</p></details>`:''}</div></details>
+  <details class="private-settings" ${shared?'open':''}><summary>${shared?'共享业务 Prompt 与私聊授权':'私聊设置（旧版）'}</summary><p class="config-help">${shared?'群聊与私聊共用一份业务 Prompt。允许谁私聊单独设置，不会因为共享规则而开放权限。':'默认只接收已添加的群。需要私聊使用时，再添加允许的用户和 Prompt。'}</p><div class="field"><label for="applicationUsers">允许私聊的用户 Open ID</label><textarea class="input" id="applicationUsers" rows="2" placeholder="每行一个 ou_…；留空则不接收私聊">${safe(a.allowed_open_ids.join('\n'))}</textarea></div><div class="field"><label for="applicationPrompt">${shared?'助手共享业务 Prompt':'私聊 Prompt（旧版独立配置）'}</label><textarea class="input" id="applicationPrompt" rows="5">${safe(a.prompt_template)}</textarea><p class="config-help">保留一个 {{message}}。${shared?'此处与群配置编辑的是同一份规则，保存影响全部群聊和私聊的新消息。创建者在任一已授权会话更新，也写回共享规则。':'旧版私聊 Prompt 与群配置独立；迁移前不会自动覆盖群版本。'}</p>${a.self_update_rule?`<details class="connection-details"><summary>在对话中更新的规则</summary><p style="white-space:pre-wrap">${safe(a.self_update_rule)}</p></details>`:''}</div></details>
   <div class="group-save-row"><button class="btn primary" id="saveApplication">${a.ref?'保存机器人设置':'验证并接入'}</button></div><div id="applicationFeedback" class="inline-feedback hidden" role="status" aria-live="polite"></div></form>`;
   node('appBack').onclick=()=>{if(vm.appDirty&&!confirm('放弃未保存的机器人设置？'))return;vm.appDirty=false;vm.app=null;if(fromGroup){view('group');pairView();}else leave();};
   bindFolderField('application','applicationProject','applicationFeedback');
@@ -219,7 +239,7 @@
    else{view(null);report('groupsNotice','应用已保存。点击“添加群配置”接入群；新应用将在开始配对时启动接收。');}
   }catch(err){report('applicationFeedback',err.message,true);}});};validateApp();
  }
- function validateApp(){if(!vm.app||!node('saveApplication'))return false;const text=node('applicationPrompt').value;const valid=text.trim()&&text.length<=8000&&text.split('{{message}}').length===2;node('applicationPrompt').setAttribute('aria-invalid',String(!valid));node('saveApplication').disabled=vm.busy||!valid||!node('applicationProject').value;if(!valid){node('applicationPrompt').closest('details').open=true;report('applicationFeedback','私聊 Prompt 需为 1 到 8000 字，且恰好包含一个 {{message}}。',true);}return !!(valid&&node('applicationProject').value);}
+ function validateApp(){if(!vm.app||!node('saveApplication'))return false;const text=node('applicationPrompt').value;const valid=text.trim()&&text.split('{{message}}').length===2;node('applicationPrompt').setAttribute('aria-invalid',String(!valid));node('saveApplication').disabled=vm.busy||!valid||!node('applicationProject').value;if(!valid){node('applicationPrompt').closest('details').open=true;report('applicationFeedback','私聊 Prompt 不能为空，且恰好包含一个 {{message}}。',true);}return !!(valid&&node('applicationProject').value);}
  async function toggleBot(ref,enabled){
   const a=app(ref);if(!a||vm.busy)return;
   await operation(async()=>{try{

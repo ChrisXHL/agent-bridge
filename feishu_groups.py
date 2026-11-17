@@ -32,11 +32,17 @@ def application_paths(default_path, inbox_path):
 def group_routes(value):
     """Unmigrated groups resolve exactly as before, without rewriting private files."""
     overrides = value.get('group_configs', {})
-    return [dict({'chat_id': chat, 'name': '已接入群 · ' + chat[-6:],
-                  'connection_id': value.get('connection_id', ''),
-                  'prompt_template': value.get('prompt_template', DEFAULT_PROMPT_TEMPLATE),
-                  'enabled': True,'topic_collaboration':False}, **overrides.get(chat, {}))
-            for chat in value.get('allowed_chat_ids', [])]
+    routes = [dict({'chat_id': chat, 'name': '已接入群 · ' + chat[-6:],
+                    'connection_id': value.get('connection_id', ''),
+                    'prompt_template': value.get('prompt_template', DEFAULT_PROMPT_TEMPLATE),
+                    'enabled': True,'topic_collaboration':False}, **overrides.get(chat, {}))
+              for chat in value.get('allowed_chat_ids', [])]
+    from assistant_prompt import is_shared, business_template
+    if is_shared(value):
+        for route in routes:
+            route['prompt_template'] = business_template(value)
+            route['self_update_rule'] = value.get('self_update_rule', '')
+    return routes
 
 
 def revision(value):
@@ -313,8 +319,11 @@ class GroupSettings:
             apps.append(item)
             for route in group_routes(value):
                 route = {k: route[k] for k in ('chat_id', 'name', 'connection_id', 'prompt_template', 'enabled','topic_collaboration')}
-                route['self_update_rule'] = value.get('group_configs', {}).get(route['chat_id'], {}).get('self_update_rule', '')
-                route.update(app_ref=ref, app_name=item['name'], revision=item['revision'])
+                from assistant_prompt import is_shared
+                route['self_update_rule'] = (value.get('self_update_rule', '') if is_shared(value) else
+                    value.get('group_configs', {}).get(route['chat_id'], {}).get('self_update_rule', ''))
+                route.update(app_ref=ref, app_name=item['name'], revision=item['revision'],
+                             prompt_policy_version=value.get('prompt_policy_version', 0))
                 try:
                     connection = self.store.connection(route['connection_id'])
                     project = self.store.project(connection['project_id'])
@@ -404,7 +413,7 @@ class GroupSettings:
                 atomic_write(path, {**value, 'enabled': data['enabled']})
             return self.catalog()
 
-    def save_app(self, data, manager_admin=None):
+    def save_app(self, data, manager_admin=None, *, prompt_policy_version=None):
         if not isinstance(data, dict) or set(data) - {'ref','revision','name','app_id','app_secret','project_id','enabled','allowed_open_ids','prompt_template'}:
             raise BridgeError(400, 'invalid_request', '应用设置包含无效字段')
         with CONFIG_LOCK:
@@ -447,6 +456,12 @@ class GroupSettings:
                      'prompt_template':prompt}
             if manager_admin:
                 value['assistant_manager']={'admin_open_id':manager_admin}
+            if prompt_policy_version is not None:
+                if type(prompt_policy_version) is not int or prompt_policy_version != 1:
+                    raise BridgeError(400, 'invalid_prompt_policy', '业务 Prompt 版本无效')
+                value['prompt_policy_version'] = prompt_policy_version
+            from assistant_prompt import sync_shared
+            sync_shared(value)
             atomic_write(path, value)
             return ref
 
@@ -503,6 +518,8 @@ class GroupSettings:
             if old.get('self_update_rule'):
                 existing[chat]['self_update_rule']=old['self_update_rule']
             value.update(group_configs=existing,allowed_chat_ids=list(existing))
+            from assistant_prompt import sync_shared
+            sync_shared(value, prompt)
             if chat not in {r['chat_id'] for r in group_routes(load(path))}:
                 value.update(pairing_code='',pairing_expires_at=0)
             atomic_write(path,value)
@@ -511,6 +528,9 @@ class GroupSettings:
         if not isinstance(data,dict) or set(data)!={'app_ref'}:raise BridgeError(400,'invalid_request','请选择应用。')
         ref,path,_=self.resolve(data['app_ref']);cfg=load(path)
         if cfg.get('assistant_manager'):raise BridgeError(400,'invalid_source','助手管理员仅限创建者私聊管理。')
+        from assistant_prompt import is_shared, business_template
+        if is_shared(cfg):
+            return {'prompt_template': business_template(cfg)}
         # Reuse the saved business purpose, with group delivery instead of private-owner delivery.
         for p in (self.config_path.parent/'assistant-onboarding').glob('asst_*/job.json'):
             j=load(p)
@@ -547,7 +567,8 @@ class GroupSettings:
         if path == '/api/feishu/apps/backend' and method == 'POST':return self.set_app_backend(data)
         if path == '/api/feishu/apps/enabled' and method == 'POST':return self.set_app_enabled(data)
         if path == '/api/feishu/apps' and method=='POST':
-            ref=self.save_app(data); return {**self.catalog(),'saved_app_ref':ref}
+            ref=self.save_app(data, prompt_policy_version=1 if not data.get('ref') else None)
+            return {**self.catalog(),'saved_app_ref':ref}
         if path == '/api/feishu/groups' and method=='POST':
             self.save_group(data); return self.catalog()
         if path == '/api/feishu/app-pairing' and method=='POST':

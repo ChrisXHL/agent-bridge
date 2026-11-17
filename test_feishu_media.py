@@ -59,8 +59,8 @@ class MediaTests(unittest.TestCase):
     self.assertEqual(sum(r['key']=='file_pdf' for r in resources),1)
     self.assertTrue(text)
  def test_post_files_do_not_bypass_limits_or_silently_drop_folders(self):
-  for files,code in (([{'file_key':'file_'+str(i)} for i in range(11)],'too_many_media'),
-                     ([{'file_key':'file_folder','is_folder':True}],'unsupported_folder'),
+  self.assertEqual(len(parse('post',{'files':[{'file_key':'file_'+str(i)} for i in range(11)]})[1]),11)
+  for files,code in (([{'file_key':'file_folder','is_folder':True}],'unsupported_folder'),
                      ([{'file_name':'missing-key.docx'}],'invalid_media'),('not-a-list','invalid_media')):
    with self.subTest(code=code):
     with self.assertRaises(MediaError) as error:parse('post',{'files':files})
@@ -91,10 +91,10 @@ class MediaTests(unittest.TestCase):
    with self.box.db() as db:db.execute('UPDATE inbound_media SET next_attempt=0')
    self.adapter.pump_once()
   self.assertEqual(self.sender.download_resource.call_count,3);self.assertEqual(self.media()['state'],'failed');self.assertNotIn('TOKEN_SECRET',json.dumps(self.sender.sent));self.assertEqual(self.bridge.submissions,[])
- def test_malformed_unsupported_and_too_many_media_return_clear_notice(self):
-  messages=[self.event('file',{'text':'missing-key'}),self.event('sticker',{'file_key':'file_x'},mid='om_sticker'),self.event('post',{'content':[[{'tag':'img','image_key':'img_'+str(i)}] for i in range(11)]},mid='om_many')]
+ def test_malformed_and_unsupported_media_return_clear_notice(self):
+  messages=[self.event('file',{'text':'missing-key'}),self.event('sticker',{'file_key':'file_x'},mid='om_sticker')]
   for e in messages:self.assertTrue(self.adapter.handle_event(e))
-  self.adapter.pump_once();self.assertEqual(len(self.sender.sent),6);self.assertEqual(self.downloads,[]);self.assertEqual(self.bridge.submissions,[])
+  self.adapter.pump_once();self.assertEqual(len(self.sender.sent),4);self.assertEqual(self.downloads,[]);self.assertEqual(self.bridge.submissions,[])
  def test_untrusted_filename_cannot_escape_attachment_directory(self):
   self.adapter.handle_event(self.event('file',{'file_key':'file_a','file_name':'../../outside/evil\n.txt'}));self.adapter.pump_once();p=Path(self.manifest()[0]['path']);self.assertEqual(p.parent.parent.name,'attachments');self.assertNotIn('\n',p.name);self.assertEqual(p.name,'01-evil_.txt')
  def test_symlink_output_is_rejected(self):

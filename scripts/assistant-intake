@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PATH="$ROOT/.tools/node_modules/.bin:$PATH"
+export PATH
+for candidate in "$ROOT/.venv/bin/python" python3.13 python3.12 python3.11 python3; do
+  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys;sys.exit(not ((3,11)<=sys.version_info[:2]<(3,14)))' 2>/dev/null; then
+    exec "$candidate" "$ROOT/assistant_intake.py" "$@"
+  fi
+done
+printf '%s\n' '{"stage":"needs_agent_review","results":[],"user_action_required":false,"next_action":"agent_fix_then_retry","warnings":["missing_supported_python"]}'
+exit 1

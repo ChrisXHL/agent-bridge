@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from codex_http_bridge import BridgeError
+from assistant_prompt import business_template, is_shared, sync_shared
 from feishu_groups import atomic_write, group_routes
 from feishu_settings import CONFIG_LOCK, load, validate_prompt_template
 
@@ -14,12 +15,12 @@ def _validate_bundle(bundle):
             or bundle.get('format') != FORMAT or bundle.get('version') != 1):
         raise BridgeError(400, 'invalid_template', '这不是助手配置文件')
     assistant = bundle['assistant']
-    if (not isinstance(assistant, dict) or set(assistant) != {
-            'name', 'prompt_template', 'self_update_rule', 'backend', 'workspace_hint'}
+    fields = {'name', 'prompt_template', 'self_update_rule', 'backend', 'workspace_hint'}
+    if (not isinstance(assistant, dict) or set(assistant) not in (fields, fields | {'prompt_policy_version'})
+            or ('prompt_policy_version' in assistant and not is_shared(assistant))
             or not isinstance(assistant['name'], str)
             or not 1 <= len(assistant['name'].strip()) <= 60
             or not isinstance(assistant['self_update_rule'], str)
-            or len(assistant['self_update_rule']) > 1600
             or assistant['backend'] not in ('codex', 'claude')
             or not isinstance(assistant['workspace_hint'], str)
             or len(assistant['workspace_hint']) > 100):
@@ -42,11 +43,12 @@ def export_template(settings, data):
                              if p['id'] == connection['project_id']), '')
         assistant = {
             'name': cfg.get('app_name') or cfg.get('bot_name') or '助手',
-            'prompt_template': cfg.get('prompt_template'),
+            'prompt_template': business_template(cfg),
             'self_update_rule': cfg.get('self_update_rule', ''),
             'backend': connection['execution_backend'],
             'workspace_hint': project_name[:100],
         }
+        if is_shared(cfg):assistant['prompt_policy_version'] = 1
         return {'bundle': {'format': FORMAT, 'version': 1, 'assistant': _validate_bundle({
             'format': FORMAT, 'version': 1, 'assistant': assistant})}, 'count': 1}
 
@@ -62,7 +64,8 @@ def apply_template(settings, data):
         if cfg.get('assistant_manager') or cfg.get('task_dispatcher'):
             raise BridgeError(409, 'special_assistant', '不能把普通助手设置覆盖到助手管理员或任务管家')
         settings.store.project(data['project_id'])
-        # Freeze legacy group defaults before changing the target's base prompt or folder.
+        # Only legacy targets freeze per-group defaults. Shared targets keep one
+        # root business source; a source template never migrates the target policy.
         routes = {route['chat_id']: route for route in group_routes(cfg)}
         connection_id = settings.connection(cfg, data['project_id'],
                                             cfg.get('app_name') or cfg.get('bot_name') or '助手',
@@ -71,7 +74,7 @@ def apply_template(settings, data):
         updated = {**cfg, 'connection_id': connection_id, 'connection_key': connection['api_key'],
                    'group_configs': routes, 'prompt_template': assistant['prompt_template'],
                    'self_update_rule': assistant['self_update_rule']}
-        atomic_write(path, updated)
+        atomic_write(path, sync_shared(updated))
         return {'applied': True, 'name': cfg.get('app_name') or cfg.get('bot_name') or '助手',
                 'execution_backend': connection['execution_backend'],
                 'source_backend': assistant['backend']}

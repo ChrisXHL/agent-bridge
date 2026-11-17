@@ -13,6 +13,8 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--context',required=True)
     sub=p.add_subparsers(dest='action',required=True);sub.add_parser('list')
     call=sub.add_parser('call');call.add_argument('--request-id',required=True);call.add_argument('--file',required=True)
+    mention=sub.add_parser('mention');mention.add_argument('--request-id',required=True);mention.add_argument('--text',required=True)
+    target=mention.add_mutually_exclusive_group(required=True);target.add_argument('--assistant-id');target.add_argument('--assistant-name')
     wait=sub.add_parser('wait');wait.add_argument('--batch',required=True);wait.add_argument('--seconds',type=int,default=60,choices=range(0,61),metavar='0..60')
     for action in ('say','ask'):
         command=sub.add_parser(action);command.add_argument('--request-id',required=True);command.add_argument('--text',required=True)
@@ -26,6 +28,9 @@ def main():
     try:
         if a.action=='list':out=request('/v1/assistant-peers')
         elif a.action=='call':out=request('/v1/assistant-calls',{'request_id':a.request_id,'requests':json.loads(Path(a.file).read_text())})
+        elif a.action=='mention':
+            target={'assistant_id':a.assistant_id} if a.assistant_id else {'assistant_name':a.assistant_name}
+            out=request('/v1/assistant-mentions',{'request_id':a.request_id,'text':a.text,**target})
         elif a.action=='say':out=request('/v1/assistant-discussions',{'request_id':a.request_id,'text':a.text})
         elif a.action=='ask':out=request('/v1/assistant-questions',{'request_id':a.request_id,'question':a.text})
         elif a.action=='answer':out=request('/v1/assistant-answers',{'question_id':a.id,'answer':a.text})

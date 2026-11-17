@@ -30,7 +30,7 @@ Bridge 投递的 Codex CLI 会话使用 Full Access（`danger-full-access`）和
 
 ## 局域网访问
 
-在 Bridge 所在的 Mac 上运行 `./scripts/enable-lan`。脚本会使用当前 `en0` 的私有 IPv4 地址，配置随登录启动的服务，并验证局域网健康检查。也可以传入指定地址，例如 `./scripts/enable-lan 192.168.1.16`。局域网面板地址为 `http://<Mac 的局域网 IP>:8788/panel`，无需证书或面板密码。Mac 的局域网 IP 改变后，重新运行 `enable-lan`。
+在 Bridge 所在的 Mac 上运行 `./scripts/enable-lan`。脚本会使用当前 `en0` 的私有 IPv4 地址，配置随登录启动的服务，并验证局域网健康检查。也可以传入指定地址，例如 `./scripts/enable-lan <LAN_IP>`。局域网面板地址为 `http://<Mac 的局域网 IP>:8788/panel`，无需证书或面板密码。Mac 的局域网 IP 改变后，重新运行 `enable-lan`。
 
 局域网入口仅绑定该私有 IP。管理页面及 `/api/` 不要求登录，页面可查看连接密钥；`/v1/tasks` 仍要求各连接自己的 Bearer 密钥。从局域网面板复制连接信息时会得到 HTTP 局域网接口地址。请只在你信任的局域网内使用，不要在路由器上转发 8788 端口。
 

@@ -27,3 +27,8 @@ feishu-apps/
 *.key
 auth.json
 credentials.json
+# Local backups, diagnostics and repair snapshots
+.backup-*/
+.repair-backup-*/
+.repair-*.bak-*
+.diagnostics/

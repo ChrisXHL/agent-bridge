@@ -1,5 +1,5 @@
 {
-  "name": "codex-feishu-bridge",
+  "name": "agent-bridge",
   "private": true,
   "version": "2.6.2",
   "description": "Local Feishu bot onboarding for Codex Bridge",

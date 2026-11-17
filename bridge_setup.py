@@ -76,6 +76,13 @@ def doctor(root=ROOT, state=DEFAULT_STATE, port=8797):
             'node_dependencies':False,
             'lark_cli':bool(cli) and probe([cli,'--version'],root),
             'codex':probe([codex,'--version'],root), 'codex_login':probe([codex,'login','status'],root)}
+    claude_backend=os.getenv('BRIDGE_BACKEND','codex').strip().lower()=='claude'
+    if claude_backend:
+        # Claude Code backend: the execution runtime is `claude`, not Codex.
+        from claude_runtime import resolve_claude_binary
+        claude=resolve_claude_binary()
+        checks['codex']=probe([claude,'--version'],root)
+        checks['codex_login']=probe([claude,'auth','status'],root)
     # Resolve modules from the copied package, never from this caller's cwd.
     checks['node_dependencies']=bool(node) and probe([node,'-e',f"require({json.dumps(str(root/'node_modules/@larksuiteoapi/node-sdk'))});require({json.dumps(str(root/'node_modules/qrcode'))})"],root)
     server=runtime(port,root,state)
@@ -92,7 +99,7 @@ def doctor(root=ROOT, state=DEFAULT_STATE, port=8797):
     if server['state'] in ('other_installation','port_conflict'):stage='port_conflict';action='inspect_existing_service'
     return {'schema_version':1,'stage':stage,'checks':checks,'missing':missing,'runtime':server,
             'next_action':action,
-            'user_action_required':stage=='needs_login','execution_backend':'Codex',
+            'user_action_required':stage=='needs_login','execution_backend':'Claude Code' if claude_backend else 'Codex',
             'acceptance':{'feishu_receipt':False,'codex_execution':False,'feishu_reply':False}}
 
 
@@ -173,6 +180,8 @@ def install(root=ROOT,state=DEFAULT_STATE,port=8797):
                 'StandardOutPath':str(state/'service.log'),'StandardErrorPath':str(state/'service-error.log'),
                 'EnvironmentVariables':{'PATH':env['PATH'],'CODEX_BIN':codex,'FEISHU_CONFIG':str(state/'feishu.json'),'BRIDGE_REQUIRE_APP':'0','PYTHONUNBUFFERED':'1'}}
         if os.getenv('BRIDGE_PROJECT_DISCOVERY')=='0':config['EnvironmentVariables']['BRIDGE_PROJECT_DISCOVERY']='0'
+        for name in ('BRIDGE_BACKEND','BRIDGE_WORKSPACE_ROOT','BRIDGE_MAX_ACTIVE_TASKS','CLAUDE_BIN','CLAUDE_MODEL','CLAUDE_PERMISSION_MODE'):
+            if os.getenv(name):config['EnvironmentVariables'][name]=os.environ[name]
         plist.parent.mkdir(parents=True,exist_ok=True);plist.write_bytes(plistlib.dumps(config));plist.chmod(0o600)
         run_logged(['launchctl','bootout',f'gui/{os.getuid()}/{label}'],state,root,timeout=10) if probe(['launchctl','print',f'gui/{os.getuid()}/{label}'],root) else None
         run_logged(['launchctl','bootstrap',f'gui/{os.getuid()}',str(plist)],state,root,timeout=15)

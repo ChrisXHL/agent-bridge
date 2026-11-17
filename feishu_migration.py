@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from codex_http_bridge import BridgeError
+from assistant_prompt import business_template, is_shared, sync_shared
 from feishu_groups import application_paths, atomic_write, group_routes
 from feishu_settings import CONFIG_LOCK, load, validate_prompt_template
 
@@ -60,12 +61,13 @@ def export_bundle(settings, data):
                 'app_id': cfg['app_id'], 'app_secret': cfg['app_secret'],
                 'kind': 'standard',
                 'name': cfg.get('app_name') or cfg.get('bot_name') or cfg['app_id'],
-                'prompt_template': cfg.get('prompt_template'),
+                'prompt_template': business_template(cfg),
                 'self_update_rule': cfg.get('self_update_rule', ''),
                 'self_update_owner_open_id': cfg.get('auto_group_owner_open_id') or '',
                 'allowed_open_ids': cfg.get('allowed_open_ids', []),
                 'project_path': project['path'], 'backend': connection['execution_backend'],
                 'groups': groups,
+                **({'prompt_policy_version': 1} if is_shared(cfg) else {}),
             })
     return {'bundle': {'format': 'codex-bridge-feishu-migration', 'version': 2, 'apps': records},
             'count': len(records), 'warnings': warnings}
@@ -105,6 +107,7 @@ def import_bundle(settings, data):
         for app in apps:
             if (not isinstance(app, dict) or not re.fullmatch(r'cli_[a-z0-9]{16}', app.get('app_id') or '') or
                     app.get('kind') != 'standard' or
+                    ('prompt_policy_version' in app and not is_shared(app)) or
                     not isinstance(app.get('app_secret'), str) or not app['app_secret'] or
                     not isinstance(app.get('name'), str) or not 1 <= len(app['name'].strip()) <= 60 or
                     not isinstance(app.get('allowed_open_ids'), list) or
@@ -114,7 +117,7 @@ def import_bundle(settings, data):
                     app.get('backend') not in ('codex', 'claude')):
                 raise BridgeError(400, 'invalid_bundle', '迁移包内容无效')
             validate_prompt_template(app.get('prompt_template'))
-            if (not isinstance(app.get('self_update_rule', ''), str) or len(app.get('self_update_rule', '')) > 1600
+            if (not isinstance(app.get('self_update_rule', ''), str)
                     or not isinstance(app.get('self_update_owner_open_id', ''), str)
                     or (app.get('self_update_owner_open_id') and
                         not re.fullmatch(r'ou_[A-Za-z0-9_-]{1,125}', app['self_update_owner_open_id']))):
@@ -131,7 +134,7 @@ def import_bundle(settings, data):
                     raise BridgeError(400, 'invalid_bundle', '迁移包中的群配置无效')
                 seen_chats.add(group['chat_id'])
                 validate_prompt_template(group.get('prompt_template'))
-                if not isinstance(group.get('self_update_rule', ''), str) or len(group.get('self_update_rule', '')) > 1600:
+                if not isinstance(group.get('self_update_rule', ''), str) :
                     raise BridgeError(400, 'invalid_bundle', '群内助手更新规则无效')
         from feishu_groups import probe
         for app in apps:
@@ -140,7 +143,8 @@ def import_bundle(settings, data):
         for app in apps:
             ref = settings.save_app({'name': app['name'], 'app_id': app['app_id'],
                 'app_secret': app['app_secret'], 'project_id': project_id, 'enabled': False,
-                'allowed_open_ids': app['allowed_open_ids'], 'prompt_template': app['prompt_template']})
+                'allowed_open_ids': app['allowed_open_ids'], 'prompt_template': app['prompt_template']},
+                prompt_policy_version=1 if is_shared(app) else None)
             _, path, _ = settings.resolve(ref)
             cfg = load(path)
             cfg['self_update_rule'] = app.get('self_update_rule', '')
@@ -159,7 +163,7 @@ def import_bundle(settings, data):
             cfg.update(allowed_chat_ids=list(routes), group_configs=routes, enabled=False,
                        migration_project_paths={'app': app['project_path'],
                                                 'groups': {g['chat_id']: g['project_path'] for g in app['groups']}})
-            atomic_write(path, cfg)
+            atomic_write(path, sync_shared(cfg))
             created.append({'name': app['name'], 'app_id': app['app_id'], 'ref': ref, 'groups': len(routes)})
     return {'created': created, 'enabled': False,
             'message': '已导入并保持停用。核对目标电脑的工作文件夹和执行工具后，再逐个启用；旧电脑随后停用。'}

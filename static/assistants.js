@@ -3,10 +3,10 @@
  const root=document.getElementById('assistantWorkspace');
  const model={jobs:[],loaded:false,loadError:false,busy:false,loading:false,requestId:null,showRemoved:false,pendingRemove:null,collaboration:null,policy:null};
  root.innerHTML=`<section id="assistantManagerEntry" class="assistant-manager-entry" aria-labelledby="assistantManagerTitle"></section>
- <section class="assistant-intro"><div><span class="assistant-eyebrow">让助手为你工作</span><h2>说说你想让它做什么</h2><p>机器人、连接和处理规则，一起配好。</p></div><div class="assistant-form-actions"><button class="btn" id="newDispatcher">创建任务管家</button><button class="btn primary" id="newAssistant">＋ 创建助手</button></div></section>
+ <section class="assistant-intro"><div><span class="assistant-eyebrow">让助手为你工作</span><h2>说说你想让它做什么</h2><p>机器人、连接和处理规则，一起配好。</p></div><div class="assistant-form-actions"><button class="btn primary" id="newAssistant">＋ 创建助手</button></div></section>
  <p id="assistantCollaborationPolicy"><span id="assistantCollaborationPolicyText">正在读取协作设置…</span> <button class="btn ghost" id="toggleCollaborationPolicy" disabled>切换</button></p>
  <form id="assistantForm" class="assistant-form hidden">
- <div class="field"><label for="assistantRequirements">你希望这个助手帮你做什么？</label><textarea class="input" id="assistantRequirements" rows="4" minlength="5" maxlength="2000" required placeholder="例如：群里发来资料后，整理成飞书文档，提取待办，再把链接发回群里。"></textarea></div>
+ <div class="field"><label for="assistantRequirements">你希望这个助手帮你做什么？</label><textarea class="input" id="assistantRequirements" rows="4" minlength="5" required placeholder="例如：群里发来资料后，整理成飞书文档，提取待办，再把链接发回群里。"></textarea></div>
  <fieldset class="assistant-audience"><legend>在哪里使用？</legend><label><input type="radio" name="assistantAudience" value="private" checked> 我自己私聊用</label><label><input type="radio" name="assistantAudience" value="group"> 在群里一起用</label></fieldset>
  <details class="assistant-options"><summary>更多选项</summary><div class="field"><label for="assistantProject">工作位置</label><select class="select" id="assistantProject"><option value="">自动创建独立工作目录</option></select><p class="config-help">默认独立保存这个助手的文件。需要处理已有项目时再选择。</p></div></details>
  <p class="assistant-explainer">点击后会根据用途准备助手，再请你用飞书扫码确认。基础文档、表格和文件能力会一起申请。</p>
@@ -17,15 +17,13 @@
  <div id="assistantJobs" aria-live="polite" aria-relevant="additions text"></div>`;
  const el=id=>document.getElementById(id);
  function showProgress(id){const card=el('assistant-'+id);if(card){const ready=card.closest('#assistantReadyDetails');if(ready)ready.open=true;card.scrollIntoView({block:'start'});card.focus({preventScroll:true});}}
- const active=j=>!['ready','failed','needs_check','removed'].includes(j.phase);
+ // waiting_group is already provisioned; keep creation gating aligned with the backend.
+ const active=j=>!['ready','failed','needs_check','removed','removing','restoring','waiting_group'].includes(j.phase);
  const labels={removed:'已移除',removing:'正在移除',restoring:'正在恢复',planning:'正在准备',registering:'正在准备扫码',waiting_scan:'等你扫码',connecting:'正在自动配置',waiting_group:'等你添加到群',ready:'已连接',failed:'需要继续配置',needs_check:'需要确认创建结果'};
  function feedback(text,error=false){el('assistantFeedback').textContent=text;el('assistantFeedback').className='inline-feedback'+(text?(error?' error':''):' hidden');}
  function validation(){
   el('submitAssistant').disabled=!model.loaded||model.busy||model.jobs.some(active)||el('assistantRequirements').value.trim().length<5;
   el('newAssistant').disabled=!model.loaded||model.busy||model.jobs.some(active);
-  const dispatcher=model.jobs.find(j=>j.kind==='dispatcher');
-  el('newDispatcher').textContent=dispatcher?(dispatcher.phase==='ready'?'打开任务管家':'查看任务管家'):'创建任务管家';
-  el('newDispatcher').disabled=!model.loaded||model.busy||(!dispatcher&&model.jobs.some(active));
   if(el('enableAssistantManager'))el('enableAssistantManager').disabled=!model.loaded||model.busy||model.jobs.some(active);
  }
  function renderManager(){
@@ -45,6 +43,7 @@
   el('toggleCollaborationPolicy').textContent=open?'改为逐次确认':'开启自由协作';
   el('toggleCollaborationPolicy').disabled=!model.policy||model.busy;
   const removed=model.jobs.filter(j=>j.phase==='removed');
+  const grouped=j=>j.phase==='ready'||j.phase==='waiting_group';
   const cards=model.jobs.filter(j=>j.phase!=='removed'||model.showRemoved).map(j=>{
    const expired=j.expires_at&&j.expires_at<=Date.now()/1000;
    let content='';
@@ -60,7 +59,7 @@
    if(j.phase==='removed')content=`<button class="btn" data-restore-assistant="${esc(j.id)}">恢复助手</button>`;
    const step=['planning','registering'].includes(j.phase)?0:j.phase==='waiting_scan'?1:['connecting','failed'].includes(j.phase)?2:3;
    const online=j.phase!=='ready'||j.runtime==='已连接飞书';
-   return {ready:j.phase==='ready',html:`<article class="assistant-card" id="assistant-${esc(j.id)}" tabindex="-1"><div class="assistant-card-heading"><div><h3>${esc(j.name||'正在准备你的助手')}</h3><p>${esc(j.summary||j.requirements)}</p></div><span class="status ${j.phase==='ready'&&online&&j.first_message_verified?'done':j.phase==='ready'?'wait':['failed','needs_check'].includes(j.phase)?'need':'wait'}">${esc(j.phase==='ready'?(!online?'正在重连':j.first_message_verified?'已验证':'已连接，待首条回复'):labels[j.phase]||j.phase)}</span></div>${!['ready','removed'].includes(j.phase)?`<ol class="assistant-progress" aria-label="创建进度">${['理解用途','扫码确认','自动配置','开始使用'].map((x,i)=>`<li class="${i<step?'complete':i===step?'current':''}">${x}</li>`).join('')}</ol>`:''}<p class="assistant-stage">${esc(j.phase==='ready'&&!online?'飞书连接暂时中断，系统正在自动重连。连接恢复前新消息可能延迟。':j.phase==='ready'&&j.first_message_verified?'消息已收到并回复飞书，可以正常使用。':j.phase==='ready'&&j.latest_task?'消息已进入 Bridge，正在处理或等待回复；请查看下面的最新任务状态。':j.message)}</p>${content}${j.limitations&&j.phase!=='removed'?`<details class="assistant-limitations"><summary>这项用途还需要什么</summary><p>${esc(j.limitations)}</p></details>`:''}</article>`};
+   return {ready:grouped(j),html:`<article class="assistant-card" id="assistant-${esc(j.id)}" tabindex="-1"><div class="assistant-card-heading"><div><h3>${esc(j.name||'正在准备你的助手')}</h3><p>${esc(j.summary||j.requirements)}</p></div><span class="status ${j.phase==='ready'&&online&&j.first_message_verified?'done':j.phase==='ready'?'wait':['failed','needs_check'].includes(j.phase)?'need':'wait'}">${esc(j.phase==='ready'?(!online?'正在重连':j.first_message_verified?'已验证':'已连接，待首条回复'):labels[j.phase]||j.phase)}</span></div>${!['ready','removed','waiting_group'].includes(j.phase)?`<ol class="assistant-progress" aria-label="创建进度">${['理解用途','扫码确认','自动配置','开始使用'].map((x,i)=>`<li class="${i<step?'complete':i===step?'current':''}">${x}</li>`).join('')}</ol>`:''}<p class="assistant-stage">${esc(j.phase==='ready'&&!online?'飞书连接暂时中断，系统正在自动重连。连接恢复前新消息可能延迟。':j.phase==='ready'&&j.first_message_verified?'消息已收到并回复飞书，可以正常使用。':j.phase==='ready'&&j.latest_task?'消息已进入 Bridge，正在处理或等待回复；请查看下面的最新任务状态。':j.message)}</p>${content}${j.limitations&&j.phase!=='removed'?`<details class="assistant-limitations"><summary>这项用途还需要什么</summary><p>${esc(j.limitations)}</p></details>`:''}</article>`};
   });
   const ready=cards.filter(x=>x.ready),other=cards.filter(x=>!x.ready);
   const html=other.map(x=>x.html).join('')+(ready.length?`<details id="assistantReadyDetails" class="assistant-ready-details"><summary>已创建的助手（${ready.length}）</summary><div>${ready.map(x=>x.html).join('')}</div></details>`:'')+(removed.length?`<button class="btn ghost" data-toggle-removed="true" aria-expanded="${model.showRemoved}">${model.showRemoved?'收起':'查看'}已移除的助手（${removed.length}）</button>`:'');
@@ -92,14 +91,6 @@
   model.busy=true;el('toggleCollaborationPolicy').disabled=true;
   try{model.policy=await api('/api/feishu/collaboration-policy',{method:'POST',body:JSON.stringify({mode:model.policy.mode==='open'?'confirm':'open'})});feedback(model.policy.mode==='open'?'自由协作已开启。已接入并启用的助手可分享任务资料、使用各自已有能力完成分工；任务管家只派给本群助手。':'已恢复逐次确认。已有明确授权继续保留。');}
   catch(e){feedback(e.message,true);}finally{model.busy=false;render();}
- };
- el('newDispatcher').onclick=async()=>{
-  const old=model.jobs.find(j=>j.kind==='dispatcher');
-  if(old){if(old.phase==='ready'&&old.open_url)window.open(old.open_url,'_blank','noopener,noreferrer');else{if(old.phase==='removed'){model.showRemoved=true;render();}showProgress(old.id);}return;}
-  if(!model.loaded||model.busy||model.jobs.some(active))return;
-  model.busy=true;validation();feedback('正在准备任务管家的扫码入口…');
-  try{const j=await api('/api/feishu/dispatcher',{method:'POST',body:'{}'});feedback('');await refreshJobs();showProgress(j.id);}
-  catch(e){feedback(e.message,true);}finally{model.busy=false;validation();}
  };
  el('closeAssistantForm').onclick=()=>el('assistantForm').classList.add('hidden');
  el('assistantRequirements').value=sessionStorage.getItem('assistantDraft')||'';

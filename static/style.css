@@ -139,6 +139,7 @@
   .source-chip{
     display:inline-flex;align-items:center;gap:6px;padding:3px 7px;background:#f1f0ef;border-radius:999px;color:#555
   }
+  .task-source-label{max-width:100%;white-space:normal;overflow-wrap:anywhere;line-height:1.5;border-radius:8px}
   .arrow{color:#aaa}
   .task-title{font-size:14px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .task-sub{font-size:12px;color:var(--muted);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -148,10 +149,10 @@
   }
   .status .s-dot{width:7px;height:7px;border-radius:50%;background:#555}
   .status.wait .s-dot{background:#9a8f7b}
-  .status.run .s-dot{background:#111}
-  .status.need .s-dot{background:#a16207}
-  .status.done .s-dot{background:#3f6212}
-  .status.fail .s-dot{background:#b91c1c}
+  .status.run .s-dot{background:#eab308}
+  .status.need .s-dot{background:#f97316}
+  .status.done .s-dot{background:#16a34a}
+  .status.fail .s-dot{background:#dc2626}
   .time{align-self:center;justify-self:end;font-size:11px;color:var(--muted)}
   .empty-card{
     border:1px dashed var(--line-strong);border-radius:16px;background:#fafafa;padding:30px;text-align:center;color:var(--muted)
@@ -458,3 +459,9 @@
 .assistant-remove-dialog{width:min(440px,calc(100vw - 40px));border:1px solid #ddd;border-radius:18px;padding:24px;color:#222;background:#fff;box-shadow:0 20px 80px #0003}.assistant-remove-dialog::backdrop{background:#0005}.assistant-remove-dialog h3{margin:0 0 16px}.assistant-remove-dialog p{line-height:1.65;margin:12px 0}.assistant-remove-dialog .assistant-form-actions{margin-top:24px;justify-content:flex-end}
 
 .assistant-collaborator{display:flex;align-items:flex-start;gap:12px;padding:12px 0;border-top:1px solid #eee;cursor:pointer}.assistant-collaborator input{margin-top:4px}.assistant-collaborator small{display:block;margin-top:5px;line-height:1.5;color:#666}#assistantCollaborationDialog{max-height:85vh;overflow:auto}#assistantCollaborationFeedback{color:#a23c20;margin-top:12px}
+
+.concurrency-list{margin:16px 0 4px;display:flex;flex-direction:column;gap:10px}
+.concurrency-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:#fff}
+.concurrency-stepper{display:flex;align-items:center;gap:6px;flex:none}
+.concurrency-stepper .btn{width:32px;height:32px;padding:0;justify-content:center}
+.concurrency-stepper .input{width:58px;text-align:center;padding:6px}

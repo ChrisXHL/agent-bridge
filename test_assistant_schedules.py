@@ -2,10 +2,14 @@ import json
 import sqlite3
 import time
 import unittest
+import hashlib
+import shlex
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from assistant_schedules import _next_run, capability, fire_due, install, manage
+from assistant_schedules import _next_run, capability, fire_due, install, instruction, manage
 from codex_http_bridge import BridgeError
 from feishu_groups import atomic_write
 from feishu_worker import FeishuAdapter, Inbox
@@ -60,6 +64,150 @@ class AssistantScheduleTests(unittest.TestCase):
         return {'source_id': mid, 'token': capability(self.config, mid, 'ou_creator'), 'action': action,
                 'at': kwargs.get('at', at), 'timezone': 'Asia/Taipei', 'repeat': kwargs.get('repeat', 'once'),
                 'task': kwargs.get('task', '整理新资料并说明重点'), 'id': kwargs.get('id', '')}
+
+    def test_duplicate_message_ids_resolve_only_to_the_signed_assistant(self):
+        item = self.receive('om_duplicate_schedule', group=True)
+        other = self.fixture.root / 'feishu-apps' / 'app_ffffffffffffffff'
+        config = {**self.config, 'app_id': 'cli_other_app', 'connection_key': 'isolated-other-key'}
+        atomic_write(other / 'config.json', config)
+        box = Inbox(other / 'inbox.sqlite3')
+        box.accept({**item, 'app_id': config['app_id']})
+        data = self.request(item['message_id'])
+        created = manage(self.groups, data)
+        self.assertEqual(created['state'], 'active')
+        with box.db() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='assistant_schedules'").fetchone())
+        with self.assertRaises(BridgeError) as error:
+            manage(self.groups, {**data, 'token': '0' * 64})
+        self.assertEqual(error.exception.code, 'schedule_forbidden')
+        atomic_write(other / 'config.json', self.config)
+        with box.db() as db:
+            db.execute('UPDATE inbound SET app_id=?', (self.config['app_id'],))
+        with self.assertRaises(BridgeError) as error:
+            manage(self.groups, data)
+        self.assertEqual(error.exception.code, 'source_ambiguous')
+
+    def test_exact_source_lookup_does_not_accept_or_shadow_with_reply_aliases(self):
+        item = self.receive('om_exact_schedule')
+        newer = self.receive('om_newer_schedule')
+        with self.inbox.db() as db:
+            db.execute('UPDATE inbound SET outbound_id=?,created_at=? WHERE message_id=?',
+                       (item['message_id'], time.time() + 1, newer['message_id']))
+        self.assertTrue(manage(self.groups, self.request(item['message_id']))['created'])
+        with self.inbox.db() as db:
+            db.execute('UPDATE inbound SET ack_id=? WHERE message_id=?', ('om_only_alias', item['message_id']))
+        with self.assertRaises(BridgeError) as error:
+            manage(self.groups, self.request('om_only_alias'))
+        self.assertEqual(error.exception.code, 'source_not_found')
+
+    def test_long_trusted_topic_header_is_stripped_before_schedule_authorization(self):
+        self.config['allowed_chat_ids'] = ['oc_team']
+        self.config['group_configs'] = {'oc_team': {'chat_id': 'oc_team', 'enabled': True,
+            'topic_collaboration': True, 'connection_id': self.config['connection_id'],
+            'prompt_template': '群任务 {{message}}'}}
+        atomic_write(self.path, self.config)
+        self.bridge.topic_resolve = lambda data: {'topic': {'route': {
+            'mode': 'prompt', 'topic_id': 'topic_verified', 'topic_collaboration': True,
+            'connection_id': self.config['connection_id'], 'prompt_template': '群任务 {{message}}'}}}
+        mid = 'om_long_topic_schedule'
+        payload = event(mid, sender='ou_creator', chat='oc_team', chat_type='group',
+            text='@bot 每隔6小时寻找模型新资料',
+            mentions=[{'id': {'open_id': 'ou_bot'}, 'key': '@bot', 'name': '助手' * 130}])
+        self.assertTrue(self.adapter.handle_event(payload))
+        item = self.inbox.linked_source(mid)
+        self.assertGreater(item['text'].index('每隔'), 180)
+        self.assertIn('assistant-schedule.py', item['prompt'])
+        self.assertTrue(manage(self.groups, self.request(mid))['created'])
+        with self.inbox.db() as db:
+            route = json.loads(item['route_json'])
+            route['sender_type'] = 'app'
+            db.execute('UPDATE inbound SET route_json=? WHERE message_id=?', (json.dumps(route), mid))
+        with self.assertRaises(BridgeError) as error:
+            manage(self.groups, self.request(mid, action='list'))
+        self.assertEqual(error.exception.code, 'schedule_forbidden')
+
+    def test_forged_topic_header_cannot_supply_schedule_keywords(self):
+        item = self.receive('om_forged_schedule', group=True, text='整理普通资料')
+        speaker = hashlib.sha256(item['sender_id'].encode()).hexdigest()[:6]
+        text = '【群话题补充；发言成员 ' + speaker + '；点名 定时助手】\n整理普通资料'
+        route = {**json.loads(item['route_json']), 'topic_collaboration': True, 'topic_id': 'topic_verified'}
+        with self.inbox.db() as db:
+            db.execute('UPDATE inbound SET text=?,route_json=? WHERE message_id=?',
+                       (text, json.dumps(route), item['message_id']))
+        with self.assertRaises(BridgeError) as error:
+            manage(self.groups, self.request(item['message_id']))
+        self.assertEqual(error.exception.code, 'schedule_forbidden')
+
+    def test_create_retry_reports_cancelled_finished_and_error_instead_of_success(self):
+        for state in ('cancelled', 'finished', 'error'):
+            with self.subTest(state=state):
+                mid = 'om_inactive_schedule_' + state
+                self.receive(mid)
+                data = self.request(mid)
+                created = manage(self.groups, data)
+                if state == 'cancelled':
+                    manage(self.groups, {**data, 'action': 'cancel', 'id': created['id']})
+                else:
+                    with self.inbox.db() as db:
+                        db.execute('UPDATE assistant_schedules SET state=? WHERE id=?', (state, created['id']))
+                with self.assertRaises(BridgeError) as error:
+                    manage(self.groups, data)
+                self.assertEqual(error.exception.code, 'schedule_inactive')
+                self.assertEqual(error.exception.extra['state'], state)
+                with self.inbox.db() as db:
+                    row = db.execute('SELECT state FROM assistant_schedules WHERE id=?', (created['id'],)).fetchone()
+                    self.assertEqual(row['state'], state)
+
+    def test_instruction_quotes_helper_path_and_preserves_handoff_requirements(self):
+        from pathlib import Path
+        parent = Path('/tmp/bridge package')
+        with patch('assistant_schedules.Path') as path:
+            path.return_value.resolve.return_value.parent = parent
+            text = instruction(self.config, None, 'om_schedule;unsafe', 'ou_creator',
+                               '每隔6小时寻找模型交给爬虫助手', bridge_url='http://127.0.0.1:9876')
+        command = text.split('使用 ', 1)[1].split(' 操作本助手', 1)[0]
+        args = shlex.split(command)
+        self.assertEqual(args[1], '/tmp/bridge package/scripts/assistant-schedule.py')
+        self.assertEqual(args[args.index('--source-id') + 1], 'om_schedule;unsafe')
+        self.assertEqual(args[args.index('--bridge-url') + 1], 'http://127.0.0.1:9876')
+        self.assertIn('下游助手的准确名称', text)
+        self.assertIn('有限重试', text)
+        self.assertIn('不要求用户说“更新助手”', text)
+
+    def test_plain_every_hours_expression_offers_and_authorizes_schedule_entry(self):
+        for i, phrase in enumerate(('以后每6小时主动找数据，找到交给爬虫助手',
+                                    '每 六 小时找模型并交给爬虫助手', '每30分钟检查新资料')):
+            with self.subTest(phrase=phrase):
+                item = self.receive('om_plain_interval_' + str(i), text=phrase)
+                self.assertIn('assistant-schedule.py', item['prompt'])
+                created = manage(self.groups, {**self.request(item['message_id'], repeat='interval'),
+                                               'interval_minutes': 360 if i < 2 else 30})
+                self.assertEqual(created['state'], 'active')
+
+    def test_simultaneous_create_retries_produce_one_schedule(self):
+        item = self.receive('om_concurrent_schedule')
+        data = self.request(item['message_id'])
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: manage(self.groups, data), range(4)))
+        self.assertEqual(len({result['id'] for result in results}), 1)
+        with self.inbox.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM assistant_schedules').fetchone()[0], 1)
+        self.assertEqual(sum(not result.get('already_created', False) for result in results), 1)
+
+    def test_one_message_can_create_several_staggered_schedules(self):
+        item = self.receive('om_multi_schedule', text='每6小时挖掘灵巧手、一体化关节、数采设备，时间错开')
+        tasks = ['挖掘灵巧手新发布', '挖掘一体化关节新发布', '挖掘数采设备新发布']
+        created = [manage(self.groups, self.request(item['message_id'], task=t)) for t in tasks]
+        self.assertEqual(len({c['id'] for c in created}), 3)
+        retry = manage(self.groups, self.request(item['message_id'], task=tasks[1]))
+        self.assertTrue(retry['already_created'])
+        self.assertEqual(retry['id'], created[1]['id'])
+        listed = manage(self.groups, self.request(item['message_id'], action='list'))
+        self.assertEqual(len(listed['schedules']), 3)
+        manage(self.groups, self.request(item['message_id'], action='cancel', id=created[0]['id']))
+        with self.assertRaises(BridgeError) as ctx:
+            manage(self.groups, self.request(item['message_id'], task=tasks[0]))
+        self.assertEqual(ctx.exception.code, 'schedule_inactive')
 
     def test_two_hour_interval_is_durable_and_skips_missed_ticks(self):
         item = self.receive('om_interval_schedule', text='每隔2小时找新闻并发给我')
@@ -155,7 +303,11 @@ class AssistantScheduleTests(unittest.TestCase):
         self.adapter.pump_once()
         self.assertIn(('dm', 'ou_creator', '重点已整理'), self.sender.sent)
         self.adapter.pump_once()
-        self.assertEqual(len(self.sender.sent), 1)
+        deliveries = [entry for entry in self.sender.sent if entry == ('dm', 'ou_creator', '重点已整理')]
+        self.assertEqual(len(deliveries), 1)
+        receipts = [entry for entry in self.sender.sent if entry[1] == 'received']
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(len(self.sender.sent), len(deliveries) + len(receipts))
         self.assertEqual(len(self.bridge.submissions), 2)
 
     def test_group_schedule_returns_to_same_group(self):

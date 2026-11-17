@@ -29,6 +29,11 @@ DEFAULT_PERMISSION_MODE = "dontAsk"
 OPEN_TOOLS = ["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Task", "TodoWrite", "Skill"]
 
 
+def backend():
+    """Local default execution backend (BRIDGE_BACKEND=claude|codex)."""
+    return os.getenv("BRIDGE_BACKEND", "codex").strip().lower()
+
+
 def workspace_root_file():
     config = os.getenv("FEISHU_CONFIG")
     return Path(config).parent / "workspace-root.txt" if config else None

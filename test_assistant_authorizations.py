@@ -198,11 +198,11 @@ class NestedTests(fixtures.CollaborationTests):
   # Both depth-1 slots are occupied; depth-2 still starts.
   with self.store.db() as db:self.assertEqual(db.execute('SELECT depth FROM assistant_calls WHERE child_task=?',(out['results'][0]['task_id'],)).fetchone()[0],2)
   for i in range(5):self.c.call(child,{'request_id':'budget-extra-'+str(i),'requests':[{'assistant_id':self.b['id'],'message':'核查'}]})
-  with self.assertRaises(BridgeError):self.call(rid='root-over-budget')
+  self.assertFalse(self.call(rid='root-no-budget')['duplicate'])
   self.store.set_task(self.parent,'已停止')
   token=json.loads((self.c.root/(child['task_id']+'.json')).read_text())['token']
   with self.assertRaises(BridgeError):self.c.authenticate('Bearer '+token)
- def test_depth_three_has_no_more_delegation_context(self):
+ def test_depth_three_still_has_delegation_context(self):
   # Fourth assistant needed to reach three edges without revisiting an ancestor.
   j=self.f.prepare();atomic_write(self.o.directory(j['id'])/'credentials.json',{'app_id':'cli_four','app_secret':'fake','owner_open_id':'ou_four','brand':'feishu'});self.f.finish(j);four=self.o.read(j['id'])
   child=self.child_session(self.call([{'assistant_id':self.a['id'],'message':'一级'}])['batch_id'])
@@ -212,7 +212,7 @@ class NestedTests(fixtures.CollaborationTests):
   self.c.configure(self.b['id'],{'targets':[four['id']],'revision':self.c.settings(self.b['id'])['revision']})
   third=self.c.call(second,{'request_id':'level-three','requests':[{'assistant_id':four['id'],'message':'三级'}]})['batch_id'];self.engine.tick()
   tid=self.c.result(second,third)['results'][0]['task_id'];task=self.store.task(tid)
-  self.assertEqual(task['status'],'执行中');self.assertNotIn('assistant-call.py',self.fake.messages[task['thread_id']][0]);self.assertFalse((self.c.root/(tid+'.json')).exists())
+  self.assertEqual(task['status'],'执行中');self.assertIn('assistant-call.py',self.fake.messages[task['thread_id']][0]);self.assertTrue((self.c.root/(tid+'.json')).exists())
  def test_send_text_sdk_contract_and_stable_uuid(self):
   sender=FeishuSender('fake','fake');sender.client=Mock();sender.client.im.v1.message.create.return_value=Mock(success=lambda:True,data=Mock(message_id='om_out'))
   self.assertEqual(sender.send_text('ou_owner','request-1','hello'),'om_out');sender.send_text('ou_owner','request-1','hello')

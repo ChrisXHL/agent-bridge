@@ -244,6 +244,7 @@ class BridgeMVPTests(unittest.TestCase):
         self.engine.tick()
         self.assertEqual(self.fake.created,1)
     def test_active_limit_queues_new_tasks_until_a_turn_finishes(self):
+        self.engine.max_active = 5
         conn=self.store.authenticate('Bearer '+self.connection['api_key'])
         ids=[]
         for index in range(6):

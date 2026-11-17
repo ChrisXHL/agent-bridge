@@ -15,6 +15,18 @@ that a Codex task has started or completed. This applies to private business
 assistants, group mentions and the assistant manager. Disabled or unauthorized
 routes stay silent.
 
+When the user gives you an assistant JSON file and asks to add it, use
+`./scripts/assistant-intake /absolute/path/file.json` directly; do not send them
+to the panel or ask for configuration fields. The bounded result tells you the
+file kind, duplicate status, prepared/active state, and the next Agent action.
+`--inspect` is read-only. Missing local tools/paths are yours to repair; ask only
+for the owner's login/QR/permission, an ambiguous target, or original-machine
+shutdown confirmation. `--source-stopped` requires that explicit confirmation,
+never infer it from the file. Existing apps are not overwritten. Templates have
+no bot identity: do not pick an unrelated target or claim a new bot was created.
+Do not expose credentials, replay messages, or equate import with real execution.
+Detailed file-intake behavior: `references/assistant-intake.md`.
+
 For installation, first-time setup, sharing or recovery, read
 [Agent setup](references/agent-setup.md). Run the packaged bridge-setup commands
 instead of handing shell commands or credential fields to the user. The user
@@ -65,6 +77,29 @@ other assistants' private data or authorize unrelated assistants.
 Historical records are read-only. Do not replay, migrate, or resume archived
 tasks through the Bridge. Ordinary group root messages remain independent;
 private conversation history must never be imported into a group task.
+
+For personal reply preferences, use only the current message's injected
+personal-preference helper. Explicit lasting language/length/format preferences
+are stored per app and human sender; temporary requests and quoted material are
+not long-term consent. Only enum values are supported, never secrets or arbitrary
+instructions. A personal preference is not a shared group rule: do not use the
+self-update tool for it. Read/update/delete only the current speaker; list in
+private chat, never disclose a profile in a group. Current requests override the
+complete current snapshot, including an empty snapshot after deletion. Bot,
+scheduled and media tasks receive no personal profile. Confirm saved/forgotten
+only after the helper succeeds; deleting a preference does not delete old chat.
+
+Ordinary assistants with prompt_policy_version=1 have one shared business Prompt
+and owner-managed appended rule for group, private, scheduled and delegated work.
+Group and app editors write the same canonical content; only newly accepted work
+uses updates. Routing, workspaces, histories and recipient authorization remain
+separate. Only the verified creator may change shared business rules from a chat;
+ordinary members may request current work or manage their own limited preferences.
+Unversioned configurations retain legacy behavior until a deliberate private-backed
+migration with scripts/unify-assistant-prompts. Prefer the selected group version;
+never silently pick between conflicting groups or replay a pending receipt.
+Managers and dispatchers keep dedicated control paths. Group schedule management
+is scoped to the current group; private owner management may list all schedules.
 
 The Feishu Prompt can be changed on the panel or through the loopback-only
 PATCH /api/feishu endpoint with {"prompt_template":"... {{message}} ..."}.

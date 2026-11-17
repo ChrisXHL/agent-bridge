@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Inspect or deliberately migrate business assistants to one shared prompt.
+
+Defaults to read-only. Conflicting group variants and busy assistants are retained.
+No bot is created, no messages are replayed, and no permissions are expanded.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import urllib.request
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from assistant_prompt import is_shared, migrate_config
+from codex_http_bridge import BridgeError
+from feishu_groups import atomic_write, revision
+from feishu_settings import load
+
+
+def run(args):
+    root = Path(args.state_dir).expanduser().resolve(strict=True)
+    sources = {}
+    for pair in args.source_group:
+        ref, sep, chat = pair.partition('=')
+        if not sep or not chat.startswith('oc_'):
+            raise ValueError('--source-group must be APP_REF=CHAT_ID')
+        sources[ref] = chat
+    # Read-only even in apply mode until the idle window is established.
+    tasks = json.load(urllib.request.urlopen(args.bridge_url.rstrip('/') + '/api/tasks', timeout=10))
+    busy = {t['connection_id'] for t in tasks if t['status'] in ('执行中', '等待 Codex', '需要你处理')}
+    creating = [load(p) for p in (root / 'assistant-onboarding').glob('*/job.json')]
+    creating = [j for j in creating if j.get('phase') not in
+                ('ready', 'failed', 'cancelled', 'removed', 'waiting_group', 'needs_check')]
+    result = []
+    files = [root / 'feishu.json', *sorted((root / 'feishu-apps').glob('app_*/config.json'))]
+    for path in files:
+        if not path.exists():
+            continue
+        cfg = load(path)
+        if not cfg.get('app_id') or cfg.get('assistant_archived') or cfg.get('account_archived'):
+            continue
+        ref = path.parent.name if path.name == 'config.json' else 'default'
+        item = {'ref': ref, 'name': cfg.get('app_name') or cfg.get('bot_name') or ref}
+        if cfg.get('assistant_manager') or cfg.get('task_dispatcher'):
+            result.append(item | {'state': 'special_role_preserved'})
+            continue
+        if is_shared(cfg):
+            result.append(item | {'state': 'already_shared'})
+            continue
+        try:
+            updated = migrate_config(cfg, source_chat_id=sources.get(ref))
+        except BridgeError as exc:
+            result.append(item | {'state': exc.code, 'groups': [
+                {'chat_id': chat, 'name': g.get('name', chat)} for chat, g in cfg.get('group_configs', {}).items()]})
+            continue
+        ids = {cfg.get('connection_id')} | {g.get('connection_id') for g in cfg.get('group_configs', {}).values()}
+        if ids & busy or any(j.get('app_ref') == ref for j in creating):
+            result.append(item | {'state': 'busy_preserved'})
+            continue
+        inbox = path.parent / ('inbox.sqlite3' if ref != 'default' else 'feishu-inbox.sqlite3')
+        if inbox.exists():
+            with sqlite3.connect('file:' + str(inbox) + '?mode=ro', uri=True) as db:
+                if db.execute('SELECT 1 FROM inbound WHERE task_id IS NULL LIMIT 1').fetchone():
+                    result.append(item | {'state': 'pending_receipt_preserved'})
+                    continue
+        # Only verified saved creator records become shared-rule administrators.
+        for job_path in (root / 'assistant-onboarding').glob('*/job.json'):
+            job = load(job_path)
+            if job.get('app_ref') != ref:
+                continue
+            cred = load(job_path.parent / 'credentials.json')
+            if cred.get('app_id') == cfg['app_id'] and cred.get('owner_open_id'):
+                updated.setdefault('auto_group_owner_open_id', cred['owner_open_id'])
+                break
+        if args.apply:
+            # Guard concurrent panel/model edits; each original goes to a private
+            # local backup, not the repository or any export bundle.
+            if revision(load(path)) != revision(cfg):
+                result.append(item | {'state': 'changed_preserved'})
+                continue
+            backup = root / 'prompt-policy-backups' / (str(time.time_ns()) + '-' + ref)
+            backup.mkdir(parents=True, mode=0o700)
+            atomic_write(backup / 'config.json', cfg)
+            atomic_write(path, updated)
+            assert load(path) == updated
+            state = 'migrated'
+        else:
+            state = 'ready'
+        result.append(item | {'state': state, 'source': sources.get(ref, 'group_consensus_or_private'),
+                              'groups': len(cfg.get('allowed_chat_ids', []))})
+    return {'applied': args.apply, 'assistants': result}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--state-dir', default=str(Path.home() / 'Library/Application Support/CodexBridgeV2'))
+    p.add_argument('--bridge-url', default='http://127.0.0.1:8797')
+    p.add_argument('--source-group', action='append', default=[], help='Explicit primary version: APP_REF=CHAT_ID')
+    p.add_argument('--apply', action='store_true')
+    args = p.parse_args()
+    print(json.dumps(run(args), ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    main()

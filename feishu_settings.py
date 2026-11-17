@@ -25,21 +25,27 @@ DEFAULT_PROMPT_TEMPLATE = (
 
 def validate_prompt_template(template):
     if (not isinstance(template, str) or not template.strip()
-            or len(template) > 8000 or template.count(MESSAGE_VARIABLE) != 1):
+            or template.count(MESSAGE_VARIABLE) != 1):
         raise BridgeError(
             400, "invalid_prompt_template",
-            "Prompt 模板需为 1 到 8000 字，并且恰好包含一次 {{message}}",
+            "Prompt 模板不能为空，并且恰好包含一次 {{message}}",
         )
     return template
 
 
-def render_prompt(template, message, source=None):
-    result = validate_prompt_template(template).replace(MESSAGE_VARIABLE, message.strip())
+def compose_prompt(template, message, source=None):
+    """Compose a validated base plus trusted runtime rules without transport limits."""
+    result = template.replace(MESSAGE_VARIABLE, message.strip())
     if source:
         fields = ('source_message_id', 'chat_id', 'app_id', 'parent_id', 'root_id')
         context = {key: source.get(key) for key in fields if source.get(key)}
         result += ('\n\n[Codex Bridge 来源信息；由接收器提供，供附件交付定位]\n'
                    + json.dumps(context, ensure_ascii=False, sort_keys=True))
+    return result
+
+
+def render_prompt(template, message, source=None):
+    result = compose_prompt(validate_prompt_template(template), message, source)
     # Match the Bridge intake body's 16 KiB limit, including JSON escaping and a follow-up task ID.
     body = json.dumps({
         "message": result, "request_id": "fs_" + "x" * 48, "task_id": "x" * 100,
@@ -47,6 +53,28 @@ def render_prompt(template, message, source=None):
     if not 1 <= len(result.strip()) <= 12000 or len(body) > 16 * 1024:
         raise BridgeError(400, "invalid_message", "模板与飞书消息合成后超过 Bridge 长度限制")
     return result
+
+
+def bounded_task_prompt(prompt, state_path, message_id):
+    """Keep full task context in a private local file when the wire body is too large."""
+    body = json.dumps({'message': prompt, 'request_id': 'fs_' + 'x' * 48,
+                       'task_id': 'x' * 100, 'continue_from': 'x' * 100},
+                      ensure_ascii=False).encode('utf-8')
+    if len(prompt) <= 12000 and len(body) <= 16 * 1024:
+        return prompt
+    import hashlib
+    from feishu_groups import atomic_write
+    folder = Path(state_path).parent / 'conversations'
+    folder.mkdir(mode=0o700, exist_ok=True)
+    folder.chmod(0o700)
+    # Content addressing prevents a later attachment/preference spill from
+    # overwriting a file already referenced by this request or a frozen retry.
+    key = hashlib.sha256((message_id + '\0' + prompt).encode()).hexdigest()
+    path = folder / (key + '.request.json')
+    atomic_write(path, {'current_request': prompt})
+    return ('本轮完整请求较长，已保存在本机文件：' + str(path.resolve())
+            + '。执行前必须读取其中 current_request 的完整内容；其中包含本轮用户消息、'
+              '当前助手规则和附件位置。前文只作背景，不重做旧任务；仅使用本轮的任务入口。')
 
 
 def load(path):
@@ -69,6 +97,7 @@ def public(value):
         "enabled": value.get("enabled", False),
         "has_secret": bool(value.get("app_secret")),
         "prompt_template": value.get("prompt_template", DEFAULT_PROMPT_TEMPLATE),
+        "prompt_policy_version": value.get("prompt_policy_version", 0),
         "pairing_code": value.get("pairing_code", ""),
         "pairing_expires_at": value.get("pairing_expires_at", 0),
         "bot_name": value.get("bot_name", ""),
@@ -95,6 +124,8 @@ def _save(path, payload, store, *, internal=None, validate_only=False):
         })
     value["prompt_template"] = validate_prompt_template(
         value.get("prompt_template", DEFAULT_PROMPT_TEMPLATE))
+    from assistant_prompt import sync_shared
+    sync_shared(value)
     if not payload.get("app_secret"):
         value["app_secret"] = current.get("app_secret", "")
     if not isinstance(value.get("enabled", False), bool):

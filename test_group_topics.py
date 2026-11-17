@@ -39,6 +39,9 @@ class TopicTests(unittest.TestCase):
   self.configs={};self.adapters={};self.sent=[]
   for i,j in enumerate(self.f.jobs):
    _,p,inbox=self.o.groups.resolve(j['app_ref']);cfg=json.loads(p.read_text())
+   # This suite covers legacy frozen per-group rules; canonical live rules
+   # are exercised by test_shared_prompt_runtime.
+   cfg.pop('prompt_policy_version',None)
    cfg.update(bot_open_id='ou_bot_'+str(i),allowed_chat_ids=['oc_shared','oc_other'],group_configs={chat:{'chat_id':chat,'name':'话题测试群','connection_id':cfg['connection_id'],'prompt_template':'群用途 {{message}}','enabled':True,'topic_collaboration':True} for chat in ('oc_shared','oc_other')})
    atomic_write(p,cfg);self.configs[j['id']]=cfg
   self.server=ThreadingHTTPServer(('127.0.0.1',0),None);self.base='http://127.0.0.1:'+str(self.server.server_port)
@@ -171,6 +174,54 @@ class TopicTests(unittest.TestCase):
   self.assertFalse(self.adapters[self.f.a['id']].handle_event(event))
   self.main.pump_once()
   with self.store.db() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM group_topics').fetchone()[0],1)
+ def test_mixed_modes_only_first_addressed_bot_accepts_root(self):
+  self.cfg['group_configs']['oc_shared']['topic_collaboration']=False
+  atomic_write(self.o.groups.resolve(self.f.source['app_ref'])[1],self.cfg)
+  helper_cfg=self.configs[self.f.a['id']]
+  payload=events.event('om_mixed_root',sender='ou_creator',chat='oc_shared',chat_type='group',
+      text='@discover 每隔6小时寻找更新，找到后交给 @crawl',mentions=[
+       {'id':{'open_id':self.cfg['bot_open_id']},'key':'@discover','name':'发现助手'},
+       {'id':{'open_id':helper_cfg['bot_open_id']},'key':'@crawl','name':'爬虫助手'}])
+  crawler=self.adapters[self.f.a['id']]
+  self.assertFalse(crawler.handle_event(payload))
+  self.assertTrue(self.main.handle_event(payload))
+  item=self.main.inbox.linked_source('om_mixed_root')
+  self.assertIsNone(crawler.inbox.linked_source('om_mixed_root'))
+  self.assertIn('爬虫助手',item['prompt'])
+  self.assertIn('群消息称呼对应表',item['prompt'])
+  self.assertNotIn('群话题补充',item['text'])
+  self.main.pump_once();self.engine.tick()
+  self.assertIsNotNone(self.main.inbox.linked_source('om_mixed_root')['task_id'])
+
+ def test_mixed_modes_first_collaborative_bot_still_owns_root(self):
+  helper_cfg=self.configs[self.f.a['id']]
+  helper_cfg['group_configs']['oc_shared']['topic_collaboration']=False
+  atomic_write(self.o.groups.resolve(self.f.a['app_ref'])[1],helper_cfg)
+  payload=self.event('om_mixed_shared_first')
+  payload['event']['message']['mentions'].append({'id':{'open_id':helper_cfg['bot_open_id']},'key':'@crawl','name':'爬虫助手'})
+  self.assertTrue(self.main.handle_event(payload))
+  self.assertFalse(self.adapters[self.f.a['id']].handle_event(payload))
+  self.assertIn('topic_id',json.loads(self.main.inbox.linked_source('om_mixed_shared_first')['route_json']))
+
+ def test_receiver_election_failure_defers_without_creating_duplicate_work(self):
+  payload=self.event('om_election_retry')
+  payload['event']['message']['mentions'].append({'id':{'open_id':self.configs[self.f.a['id']]['bot_open_id']},'key':'@other'})
+  with patch.object(self.main.bridge,'group_recipient',side_effect=OSError('temporary')):
+   self.assertTrue(self.main.handle_event(payload))
+  self.assertIsNone(self.main.inbox.linked_source('om_election_retry'))
+  self.assertEqual(len(self.main.inbox.deferred_topic_events()),1)
+  self.main.pump_once()
+  self.assertEqual(self.main.inbox.deferred_topic_events(),[])
+  self.assertIsNotNone(self.main.inbox.linked_source('om_election_retry')['task_id'])
+
+ def test_receiver_election_rejects_foreign_group_and_bad_request(self):
+  with self.assertRaises(HTTPError) as error:
+   self.main.bridge.group_recipient({'chat_id':'oc_foreign','mentions':[self.cfg['bot_open_id']]})
+  self.assertEqual(error.exception.code,403)
+  with self.assertRaises(HTTPError) as error:
+   self.main.bridge.group_recipient({'chat_id':'oc_shared','mentions':'not-a-list'})
+  self.assertEqual(error.exception.code,400)
+
  def test_different_roots_make_separate_tasks_and_connection_cannot_read_foreign_topic(self):
   one,topic=self.start();two,_=self.start('om_group_2');self.assertNotEqual(one,two)
   with self.assertRaises(HTTPError) as error:self.adapters[self.f.a['id']].bridge.topic(topic)
@@ -297,8 +348,9 @@ class TopicTests(unittest.TestCase):
  def test_discussion_budget_and_recovery_do_not_duplicate_delivery(self):
   task,_=self.start();session,_=self.session(task)
   for i in range(24):self.c.topics.say(session,{'request_id':'discussion-'+str(i),'text':'讨论 '+str(i)})
-  with self.assertRaises(BridgeError):self.c.topics.say(session,{'request_id':'discussion-over','text':'多余消息'})
-  self.c.topics.deliver();self.c.topics.deliver();count=len(self.sent)
+  self.c.topics.say(session,{'request_id':'discussion-over','text':'不设上限'})
+  for _ in range(3):self.c.topics.deliver()
+  count=len(self.sent);self.assertGreaterEqual(count,25)
   from group_topics import GroupTopics
   recovered=GroupTopics(self.c,sender_factory=lambda app,secret:Sender(app,self.sent));recovered.deliver();self.assertEqual(len(self.sent),count)
  def test_backend_requires_real_group_message_permission_before_enabling(self):

@@ -44,15 +44,15 @@ class PromptModeTests(unittest.TestCase):
     def test_fresh_inbox_has_no_card_or_workflow_tables(self):
         with self.inbox.db() as db:
             tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables,{'inbound','pairing','inbound_media','private_submissions'})
+        self.assertEqual(tables,{'inbound','pairing','inbound_media','private_submissions','bot_message_cursors'})
 
     def test_review_marker_is_returned_as_text_without_card(self):
         self.adapter.handle_event(event());self.adapter.pump_once()
         tid=self.inbox.linked_source('om_first')['task_id']
         self.bridge.tasks[tid]={'status':'已完成','result':'FEISHU_REVIEW_DOC_URL: https://example.feishu.cn/docx/fixture'}
         self.adapter.pump_once();self.adapter.pump_once()
-        self.assertEqual(len(self.sender.sent),1)
-        self.assertIn('FEISHU_REVIEW_DOC_URL',self.sender.sent[0][2])
+        self.assertEqual([message[1] for message in self.sender.sent], ['received', '已完成'])
+        self.assertIn('FEISHU_REVIEW_DOC_URL',self.sender.sent[-1][2])
 
     def test_new_settings_ignore_but_preserve_private_legacy_config(self):
         path=self.root/'feishu.json'

@@ -89,7 +89,7 @@ class CollaborationTests(unittest.TestCase):
   self.assertEqual(fresh.authenticate('Bearer '+self.context['token'])['task_id'],self.parent)
   self.assertEqual(fresh.call(self.session,{'request_id':'call-request-one','requests':[{'assistant_id':self.a['id'],'message':'查清楚事实'},{'assistant_id':self.b['id'],'message':'独立核查事实'}]})['batch_id'],batch)
   for i in range(3):self.call(rid='more-calls-'+str(i))
-  with self.assertRaises(BridgeError):self.call(rid='over-the-budget')
+  self.assertFalse(self.call(rid='no-budget-cap')['duplicate'])
   self.engine.tick()
   with self.store.db() as db:row=dict(db.execute('SELECT m.* FROM messages m JOIN assistant_calls c ON c.child_task=m.task_id LIMIT 1').fetchone())
   self.assertIn('assistant-call.py',fresh.prepare(row))

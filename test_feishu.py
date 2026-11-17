@@ -272,7 +272,13 @@ class FeishuBridgeTests(unittest.TestCase):
     def test_prompt_respects_bridge_request_size(self):
         with self.assertRaises(BridgeError):
             render_prompt("{{message}}", "中" * 6000)
-        self.assertFalse(self.adapter.handle_event(event(text="中" * 6000)))
+        self.assertTrue(self.adapter.handle_event(event(text="中" * 6000)))
+        self.adapter.pump_once()
+        prompt = self.bridge.submissions[0][0]
+        self.assertLess(len(json.dumps({'message': prompt}, ensure_ascii=False).encode()), 16 * 1024)
+        saved = list((Path(self.inbox.path).parent / 'conversations').glob('*.request.json'))
+        self.assertEqual(len(saved), 1)
+        self.assertIn('中' * 6000, json.loads(saved[0].read_text())['current_request'])
 
     def test_bridge_failure_keeps_inbox_for_retry(self):
         self.adapter.handle_event(event())

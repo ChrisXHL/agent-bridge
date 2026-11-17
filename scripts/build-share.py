@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 DOCUMENTS=['AGENTS.md','README.md','.env.example','.gitignore','requirements.txt','package.json','package-lock.json','run.sh','.mcp.json','.codex-plugin/plugin.json']
-SCRIPTS=['assistant-call.py','bridge-setup','launch-mcp','register-assistant.cjs','install-daemon','uninstall-daemon','build-share.py']
+SCRIPTS=['assistant-intake','unify-assistant-prompts','assistant-call.py','update-assistant-self.py','assistant-schedule.py','personal-preference.py','bridge-setup','launch-mcp','register-assistant.cjs','install-daemon','uninstall-daemon','build-share.py']
 
 
 def build(output,root=ROOT):

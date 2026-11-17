@@ -1,31 +1,75 @@
-"""Conversation-scoped updates to an assistant's working rules."""
+"""Owner-authorized shared rules, with legacy conversation scopes preserved."""
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
 import re
+import shlex
+import time
 from pathlib import Path
+
+from assistant_source import resolve_source
+from assistant_prompt import is_shared, shared_rule
 
 from codex_http_bridge import BridgeError
 from feishu_groups import atomic_write, group_routes
 from feishu_settings import CONFIG_LOCK, load
 
 
-MAX_RULE_LENGTH = 1600
+MAX_RULE_LENGTH = 50000
+# Unused message capabilities expire; consumed capabilities remain permanently
+# idempotent and cannot be repurposed for a different rule.
+UPDATE_AUTH_TTL_SECONDS = 24 * 60 * 60
 
 
 def explicit_request(text):
-    """Keep write access out of ordinary tasks and quoted source material."""
-    if not isinstance(text, str) or not 5 <= len(text.strip()) <= 2000:
+    """Offer the scoped tool for direct requests, not mentions or source quotes."""
+    if not isinstance(text, str) or not 4 <= len(text.strip()) <= 50000:
         return False
-    head = text.strip()[:60]
-    return bool(re.match(r'^(?:请|帮我|麻烦)?\s*(?:以后|今后|从现在起|把你|修改你|修改自己|更新你|更新自己|升级你|调整你|调整自己|给自己加|改一下你|你以后|你今后|清除你|删掉你|重置你)', head)
-                or re.match(r'^我(?:希望|想|要)\s*(?:你|让你).*(?:以后|今后|改|调整)', head))
+    text = text.strip()
+    head = text[:60]
+    # Keep existing conversational requests compatible. Both intake and write
+    # validation call this function; aliases must work at both boundaries.
+    if (re.match(r'^(?:请|帮我|麻烦)?\s*(?:以后|今后|从现在起|把你|修改你|修改自己|更新你|更新自己|升级你|调整你|调整自己|给自己加|改一下你|你以后|你今后|清除你|删掉你|重置你)', head)
+            or re.match(r'^我(?:希望|想|要)\s*(?:你|让你).*(?:以后|今后|改|调整)', head)):
+        return True
+    prefix = r'^(?:(?:请|帮我|麻烦你?|请帮我)\s*)?'
+    # The user's convention: anything they ask the assistant to "记住" is a
+    # long-term rule to save, e.g. "记住，后面如果遇到阻断……".
+    # "记住" anywhere ("改一遍，记住，…", "以后记住啊", "记住了吗？") counts;
+    # only questions about what the phrase means are excluded.
+    if (re.search(r'记住|记下|记好|牢记', text)
+            and not re.search(r'(?:记住|记下|记好|牢记)[^。！!\n]{0,12}(?:什么意思|怎么(?:用|操作|办)|是指)', text)):
+        return True
+    target = r'(?:(?:你的|本助手的|本群的|当前群的)?(?:长期规则|工作规则|业务规则|回复风格|规则)|(?:这个|本)?助手)'
+    command = re.match(prefix + r'(?:更新|修改|调整|更改|新增|添加|补充|增加|删除|清除|重置)(?:一下)?\s*' + target, text)
+    remember = re.match(prefix + r'(?:记住|记下)(?:这个|以下|这条|这项)?(?:要求|规则|偏好)', text)
+    match = command or remember
+    if not match:
+        return False
+    tail = text[match.end():].strip()
+    # A bare command may ask what to change, but never invents a saved rule.
+    # Require a boundary: e.g. 更新规则文档 / 更新助手软件 are ordinary tasks.
+    return (not tail or bool(re.match(r'^(?:[：:,，。\n]|为|改为|调整为|以后|今后|从现在起|每次|回答时|输出时)', tail)))
 
 
-def owner_for(config, config_path=None):
-    """Prefer the verified creator; a sole paired private user covers legacy bots."""
+def request_text(item, route):
+    """Remove exactly one receiver-owned topic header, never quoted user text."""
+    text = item.get('text')
+    if (not isinstance(text, str) or item.get('chat_type') != 'group'
+            or route.get('sender_type') != 'user' or not route.get('topic_id')
+            or route.get('topic_collaboration') is not True):
+        return text
+    speaker = hashlib.sha256(item['sender_id'].encode()).hexdigest()[:6]
+    header = r'\A【群话题补充；发言成员 ' + speaker + r'(?:；点名 [^\r\n]*)?】\n'
+    # A user-supplied lookalike remains in the body after this single removal,
+    # and fails the same anchored explicit-request check as ordinary quoted text.
+    return re.sub(header, '', text, count=1)
+
+
+def owner_for(config, config_path=None, verified_only=False):
+    """Resolve the creator; sole paired-user fallback is only for legacy scopes."""
     owner = (config.get('auto_group_owner_open_id')
              or (config.get('task_dispatcher') or {}).get('owner_open_id')
              or (config.get('assistant_manager') or {}).get('admin_open_id'))
@@ -42,6 +86,8 @@ def owner_for(config, config_path=None):
             credentials = load(job_path.parent / 'credentials.json')
             if credentials.get('app_id') == config.get('app_id') and credentials.get('owner_open_id'):
                 return credentials['owner_open_id']
+    if verified_only:
+        return None
     allowed = config.get('allowed_open_ids') or []
     return allowed[0] if len(allowed) == 1 else None
 
@@ -55,29 +101,42 @@ def capability(config, message_id, sender_id):
 
 
 def instruction(config, config_path, message_id, sender_id, chat_type, chat_id, user_text,
-                has_media=False, sender_type='user'):
-    """Offer group-only updates to human members, global updates to the owner."""
+                has_media=False, sender_type='user', bridge_url='http://127.0.0.1:8797'):
+    """Offer shared updates only to the verified owner; preserve legacy scopes."""
+    shared = is_shared(config)
+    owner = owner_for(config, config_path, verified_only=shared)
     if (config.get('assistant_manager') or sender_type != 'user'
-            or (chat_type == 'p2p' and sender_id != owner_for(config, config_path))
+            # Any human member of a connected group may save rules (the user's
+            # choice: "群内其他人说记住，也要记住"); private chats stay owner-only.
+            or (chat_type == 'p2p' and sender_id != owner)
             or chat_type not in ('p2p', 'group') or has_media or not explicit_request(user_text)):
         return ''
     token = capability(config, message_id, sender_id)
     if not token:
         return ''
     script = Path(__file__).resolve().parent / 'scripts' / 'update-assistant-self.py'
-    scope = '当前群' if chat_type == 'group' else '全部新任务'
+    scope = ('本助手全部后续新任务（私聊、所有已接入群及定时共用同一业务规则；不合并会话或授权）'
+             if shared else '当前群' if chat_type == 'group' else '全部新任务')
+    command = shlex.join(['python3', str(script), '--source-id', message_id, '--token', token,
+                          '--bridge-url', bridge_url])
     return (f"\n\n[Bridge 可信助手更新入口；{'当前群成员' if chat_type == 'group' else '创建者'}可用] "
             "只有发言者明确要求改变你长期的用途、做事规则或回复风格时，"
-            f"才运行 python3 {script} --source-id {message_id} --token {token} --rule '合并旧规则后的完整新规则'。"
+            "“更新助手”“更新规则”“修改规则”“新增规则”“记住这个要求”等都是可能的更新表达。"
+            "用户以“记住”“记下”“牢记”开头的要求，一律是让你把它记录成长期规则，必须保存，不能只口头答应。"
+            "若只说更新助手或更新规则却未说明具体变化，先询问要改什么，不要自行改写；"
+            "安装升级软件、修改规则文档、引用转述和询问用法不属于长期规则更新。"
+            f"确认属于明确的长期规则更新后，才运行 {command} --rule '合并旧规则后的完整新规则'。"
             f"当前消息更新范围：{scope}。如需清除之前追加的规则，用 --clear 代替 --rule。"
             "先真正执行并读回成功结果，再告诉用户已更新；不要只口头答应。"
             "新规则不能改变飞书权限、工作文件夹、执行工具、其他助手或历史任务；这些须走现有设置。"
-            "令牌仅用于本条消息，不要在回复中展示。")
+            "本条入口24小时内可首次更新，成功后只允许同内容重试；不要在回复中展示令牌。")
 
 
 def applied_rule(config, chat_id=None):
-    global_rule = str(config.get('self_update_rule') or '').strip()
-    group = (config.get('group_configs') or {}).get(chat_id, {}) if chat_id else {}
+    global_rule = (shared_rule(config) if is_shared(config)
+                   else str(config.get('self_update_rule') or '').strip())
+    group = ((config.get('group_configs') or {}).get(chat_id, {})
+             if chat_id and not is_shared(config) else {})
     group_rule = str(group.get('self_update_rule') or '').strip()
     parts = []
     if global_rule:
@@ -94,30 +153,47 @@ def update(groups, data):
     if (not isinstance(source_id, str) or not re.fullmatch(r'om_[A-Za-z0-9_-]{3,128}', source_id)
             or not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{64}', token)
             or not isinstance(rule, str) or not isinstance(clear, bool)
-            or (clear and rule) or (not clear and not 5 <= len(rule.strip()) <= MAX_RULE_LENGTH)):
-        raise BridgeError(400, 'invalid_request', '请提供 5 到 1600 字的新规则，或清除已追加的规则')
+            or (clear and rule) or (not clear and len(rule.strip()) < 5)):
+        raise BridgeError(400, 'invalid_request', '请提供至少 5 个字的新规则，或清除已追加的规则')
     # The message ID is looked up in saved Feishu receipts, never accepted as an identity claim.
     with CONFIG_LOCK:
-        matches = []
-        from feishu_groups import application_paths
-        from feishu_worker import Inbox
-        for ref, path, inbox_path in application_paths(groups.config_path, groups.inbox_path):
-            if not inbox_path.exists():
-                continue
-            item = Inbox(inbox_path).linked_source(source_id)
-            if item and item['message_id'] == source_id:
-                matches.append((ref, path, item))
-        if len(matches) != 1:
-            raise BridgeError(404, 'source_not_found', '找不到这条助手消息')
-        ref, path, item = matches[0]
-        config = load(path)
+        ref, path, inbox_path, item, config = resolve_source(
+            groups, source_id, token, capability, 'self_update_forbidden', '这条消息不能更新助手规则')
         route = json.loads(item.get('route_json') or '{}')
+        from personal_preferences import candidates as preference_candidates
+        if preference_candidates(request_text(item, route)):
+            raise BridgeError(403, 'personal_preference_only', '这条是个人回复偏好，不能覆盖群或助手业务规则')
         if (not config.get('enabled') or config.get('assistant_archived') or config.get('account_archived')
                 or config.get('assistant_manager') or item.get('app_id') != config.get('app_id')
                 or route.get('mode') != 'prompt'
-                or not explicit_request(item.get('text'))
-                or not hmac.compare_digest(token, capability(config, source_id, item['sender_id']))):
+                or not explicit_request(request_text(item, route))):
             raise BridgeError(403, 'self_update_forbidden', '这条消息不能更新助手规则')
+        shared = is_shared(config)
+        normalized = rule.strip().replace('{{message}}', '用户消息') if not clear else ''
+        prior = (config.get('self_update_receipts') or {}).get(source_id)
+        if shared and prior:
+            # A consumed capability keeps its original meaning across migration.
+            # In particular, a former member's group receipt is only a read-only
+            # retry, never authorization to change the new shared business rule.
+            scopes = [('all', None)]
+            if item.get('chat_type') == 'group':
+                scopes.append(('group', item['chat_id']))
+            for old_scope, old_chat in scopes:
+                receipt = hashlib.sha256(json.dumps(
+                    {'scope': old_scope, 'chat_id': old_chat, 'rule': normalized},
+                    ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+                if hmac.compare_digest(prior, receipt):
+                    current = ((config.get('group_configs') or {}).get(old_chat, {}).get('self_update_rule', '')
+                               if old_scope == 'group' else shared_rule(config))
+                    return {'updated': True, 'scope': old_scope, 'rule': normalized, 'already_applied': True,
+                            'current_rule': current, 'superseded': current != normalized}
+            raise BridgeError(409, 'self_update_conflict', '这条消息已更新过规则，不能再次覆盖；请发送新消息')
+        if shared and (type(route.get('prompt_policy_version')) is not int
+                       or route.get('prompt_policy_version') != 1
+                       or (item.get('chat_type') != 'group'
+                           and item['sender_id'] != owner_for(config, path, verified_only=True))
+                       or route.get('sender_type') != 'user'):
+            raise BridgeError(403, 'self_update_forbidden', '只有群成员或创建者的新消息能更新本助手共享业务规则')
         if item.get('chat_type') == 'group':
             chat_id = item['chat_id']
             routes = {r['chat_id']: r for r in group_routes(config)}
@@ -127,29 +203,35 @@ def update(groups, data):
             if route.get('sender_type') != 'user' and not (
                     'sender_type' not in route and item['sender_id'] == owner_for(config, path)):
                 raise BridgeError(403, 'self_update_forbidden', '只有当前群的成员能更新本群规则')
-            scope = 'group'
-        elif (item.get('chat_type') == 'p2p' and item['sender_id'] == owner_for(config, path)
+            scope = 'all' if shared else 'group'
+            if shared:
+                chat_id = None
+        elif (item.get('chat_type') == 'p2p' and item['sender_id'] == owner_for(config, path, verified_only=shared)
               and item['sender_id'] in config.get('allowed_open_ids', [])):
             scope = 'all'
             chat_id = None
         else:
             raise BridgeError(403, 'self_update_forbidden', '当前会话不能更新助手')
-        normalized = rule.strip().replace('{{message}}', '用户消息') if not clear else ''
         receipt = hashlib.sha256(json.dumps({'scope': scope, 'chat_id': chat_id, 'rule': normalized},
                                             ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         prior = (config.get('self_update_receipts') or {}).get(source_id)
         if prior:
             if prior != receipt:
                 raise BridgeError(409, 'self_update_conflict', '这条消息已更新过规则，不能再次覆盖；请发送新消息')
-            return {'updated': True, 'scope': scope, 'rule': normalized, 'already_applied': True}
+            current = ((config.get('group_configs') or {}).get(chat_id, {}).get('self_update_rule', '')
+                       if scope == 'group' else config.get('self_update_rule', ''))
+            return {'updated': True, 'scope': scope, 'rule': normalized, 'already_applied': True,
+                    'current_rule': current, 'superseded': current != normalized}
+        created_at = item.get('created_at')
+        if (not isinstance(created_at, (int, float)) or not 0 <= time.time() - created_at <= UPDATE_AUTH_TTL_SECONDS):
+            raise BridgeError(403, 'self_update_expired', '这条消息的规则更新入口已过期，请发送新消息确认')
         if scope == 'group':
             config.setdefault('group_configs', {}).setdefault(chat_id, {})['self_update_rule'] = normalized
         else:
             config['self_update_rule'] = normalized
         receipts = config.setdefault('self_update_receipts', {})
         receipts[source_id] = receipt
-        if len(receipts) > 100:
-            for old in list(receipts)[:-100]:
-                del receipts[old]
+        # Existing receipt hashes are the durable consumed-capability ledger.
+        # Never evict them: eviction would authorize a previously used message again.
         atomic_write(path, config)
         return {'updated': True, 'scope': scope, 'rule': normalized, 'already_applied': False}
