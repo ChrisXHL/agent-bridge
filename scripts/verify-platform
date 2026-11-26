@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Check a platform adapter against the Bridge platform rules, offline.
+
+    ./scripts/verify-platform telegram
+
+1. Contract: platforms/<id>.py loads, metadata is complete, the hooks for its
+   bind mode are implemented, no TODO is left, defaults are not loosened.
+2. Simulation: the real Bridge Store in a temporary folder, the platform's own
+   Channel class with network hooks stubbed, and a fake task API. It walks
+   bind → pairing → message → task → reply, follow-up continuity, 新对话,
+   dedupe, user/group isolation, 记住 and secret hiding.
+
+Passing this is NOT proof the real platform works: afterwards bind a real bot
+in an isolated Bridge and send one harmless message (see acceptance.md).
+"""
+import inspect
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from platform_channel import PlatformChannel, load_platform_classes  # noqa: E402
+
+FAIL, WARN = [], []
+
+
+def check(ok, message, warn=False):
+    if not ok:
+        (WARN if warn else FAIL).append(message)
+    return ok
+
+
+def contract(pid):
+    path = ROOT / "platforms" / (pid + ".py")
+    if not check(path.exists(), "缺少 platforms/%s.py（先运行 ./scripts/new-platform）" % pid):
+        return None
+    classes = load_platform_classes([ROOT / "platforms"])
+    cls = classes.get(pid)
+    if not check(cls is not None, "platforms/%s.py 无法加载，或 Channel.ID 与文件名不一致（看服务日志）" % pid):
+        return None
+    source = path.read_text(encoding="utf-8")
+    check("TODO" not in source, "文件里还有 TODO，没有实现完")
+    check(bool(cls.LABEL.strip()), "LABEL 不能为空")
+    check(cls.BIND_MODE in ("qr", "form"), "BIND_MODE 只能是 qr 或 form")
+    check(cls.ICON.startswith("M"), "ICON 需为 24x24 SVG path 的 d 值", warn=True)
+    overridden = lambda name: getattr(cls, name) is not getattr(PlatformChannel, name)
+    for hook in ("receive", "send_text"):
+        check(overridden(hook), "没有实现 %s()" % hook)
+    if cls.BIND_MODE == "form":
+        check(overridden("bind_form"), "表单接入需要实现 bind_form()")
+        check(bool(cls.BIND_FIELDS), "表单接入需要 BIND_FIELDS")
+        for f in cls.BIND_FIELDS:
+            check({"key", "label"} <= set(f), "BIND_FIELDS 每项需要 key 和 label")
+            if any(w in f.get("key", "").lower() for w in ("secret", "token", "password", "key")):
+                check(bool(f.get("secret")), "字段 %s 像凭证，应设置 secret=True" % f.get("key"))
+    else:
+        check(overridden("qr_begin") and overridden("qr_poll"), "扫码接入需要实现 qr_begin() 和 qr_poll()")
+    if overridden("is_allowed"):
+        WARN.append("覆盖了 is_allowed()：确认没有放开给所有人（下面的模拟会检查陌生人）")
+    check("print(" not in source, "不要用 print 输出，可能把凭证打进日志", warn=True)
+    check(cls.REPLY_LIMIT >= 200, "REPLY_LIMIT 太小", warn=True)
+    return cls
+
+
+def simulate(cls):
+    from service import Store
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "work").mkdir()
+        store = Store(str(tmp / "bridge.sqlite3"), str(tmp / "projects.json"))
+        sent, tasks, submitted = [], {}, []
+
+        class Probe(cls):
+            def receive(self, account):
+                self.stop.wait(1)
+                return [], {}
+
+            def send_text(self, account, target, text):
+                sent.append((target["chat_id"], target["chat_type"], text))
+                return True
+
+            def _bridge(self, aid, method, path, payload=None):
+                self._connection(aid)
+                if method == "POST":
+                    tid = "task_%d" % (len(tasks) + 1)
+                    tasks[tid] = {"task_id": tid, "status": "执行中", "result": ""}
+                    submitted.append(dict(payload))
+                    return tasks[tid]
+                return tasks[path.rsplit("/", 1)[-1]]
+
+        import os
+        os.environ["BRIDGE_WORKSPACE_ROOT"] = str(tmp / "work")
+        ch = Probe(tmp / "state", "http://127.0.0.1:1", store)
+        secret = "sk-verify-" + "x" * 24
+        name = ch._add_or_refresh({"bot_id": "bot-1", "secrets": {"token": secret}})
+        a = ch.accounts()[0]
+        st = ch.status()
+        check(secret not in str(st), "面板状态泄露了凭证")
+        check(a["project_id"] and Path(store.project(a["project_id"])["path"]).name == name,
+              "新机器人没有自动建立同名工作文件夹")
+        code = st["accounts"][0]["pair_code"]
+        check(bool(code), "没有 owner 的机器人应显示配对码")
+
+        def msg(mid, text, sender="u1", chat="u1", kind="user", files=None):
+            return {"message_id": mid, "chat_id": chat, "chat_type": kind, "sender_id": sender,
+                    "text": text, "attachments": files or []}
+
+        def finish(result="好的"):
+            for t in tasks.values():
+                if t["status"] == "执行中":
+                    t.update(status="已完成", result=result)
+
+        check(ch.accept(a, msg("m0", "你好", sender="stranger")) is False, "配对前陌生人消息不应进入任务")
+        ch.accept(a, msg("m1", "配对 " + code))
+        a = ch.account(a["id"])
+        check(a.get("owner_user_id") == "u1", "发送配对码后没有绑定主人")
+        check(any("配对成功" in s[2] for s in sent), "配对成功没有回复")
+        check(ch.accept(a, msg("m2", "做件事", sender="stranger", chat="stranger")) is False,
+              "陌生人的消息被接收了：is_allowed 不能放开给所有人")
+
+        ch.accept(a, msg("m3", "第一条", files=[{"name": "a.txt", "data": b"hi"}]))
+        check(ch.accept(a, msg("m3", "第一条")) is False, "同一 message_id 重复接收")
+        ch.deliver_once()
+        check(len(submitted) == 1 and "第一条" in submitted[0]["message"], "消息没有提交成 Bridge 任务")
+        check("附件已保存在本机" in submitted[0]["message"], "附件没有保存到本机并写入任务")
+        ch.accept(a, msg("m4", "第二条"))
+        ch.deliver_once()
+        check(len(submitted) == 1, "上一条没完成时同一会话不应提交下一条")
+        finish("结果一")
+        ch.deliver_once()
+        check(any(s[2] == "结果一" for s in sent), "任务完成后结果没有回到原聊天")
+        ch.deliver_once()
+        check(len(submitted) == 2 and submitted[1].get("continue_from") == "task_1",
+              "追问没有接着同一会话（continue_from）")
+        finish()
+        ch.deliver_once()
+        n = len(sent)
+        ch.deliver_once()
+        check(len(sent) == n, "结果被重复发送")
+
+        ch.accept(a, msg("m5", "群里的事", chat="g1", kind="group"))
+        ch.deliver_once()
+        check(len(submitted) == 3 and "continue_from" not in submitted[2], "群聊不应接私聊的会话")
+        finish()
+        ch.deliver_once()
+
+        ch.accept(a, msg("m6", "新对话"))
+        ch.deliver_once()
+        check(any("已开始新对话" in s[2] for s in sent), "“新对话”没有回复")
+        ch.accept(a, msg("m7", "重新来"))
+        ch.deliver_once()
+        check("continue_from" not in submitted[-1], "“新对话”之后仍接着旧会话")
+        finish()
+        ch.deliver_once()
+
+        ch.accept(a, msg("m8", "记住：以后回复都用英文"))
+        ch.deliver_once()
+        check("update-platform-rule.py" in submitted[-1]["message"] and "--platform" in submitted[-1]["message"],
+              "“记住…”没有附上规则保存入口")
+        finish()
+        ch.deliver_once()
+        row = "%s:m8" % a["id"]
+        token = ch._rule_token(ch.account(a["id"]), row)
+        ch.self_update({"source_id": row, "token": token, "rule": "回复用英文。\n\n{{message}}"})
+        check("英文" in ch.account(a["id"])["prompt"], "规则没有写进业务 Prompt")
+        try:
+            ch.self_update({"source_id": row, "token": "bad", "rule": "x" * 10})
+            check(False, "错误令牌也能改规则")
+        except ValueError:
+            pass
+
+        ch.patch(a["id"], {"enabled": False})
+        check(ch.status()["accounts"][0]["runtime"] == "已停用", "停用状态不对")
+        ch.delete(a["id"])
+        check(not ch.accounts(), "删除没有生效")
+        ch.close()
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("用法：./scripts/verify-platform <id>")
+    cls = contract(sys.argv[1])
+    if cls and not FAIL:
+        try:
+            simulate(cls)
+        except Exception as exc:   # report, don't hide
+            FAIL.append("模拟流程出错：%r" % exc)
+    for w in WARN:
+        print("提醒：" + w)
+    for f in FAIL:
+        print("未通过：" + f)
+    if FAIL:
+        sys.exit(1)
+    print("通过：%s 符合平台接入规则（离线）。还需要用真实账号做一次收发验收。" % sys.argv[1])
+
+
+if __name__ == "__main__":
+    main()

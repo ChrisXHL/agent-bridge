@@ -23,7 +23,7 @@ class FakeBridge:
         self.submissions = []
         self.continuations = []
 
-    def submit(self, message, request_id, task_id=None, *, continue_from=None):
+    def submit(self, message, request_id, task_id=None, *, continue_from=None, private=False):
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("Bridge temporarily unavailable")
@@ -95,11 +95,30 @@ class FeishuBridgeTests(unittest.TestCase):
         self.assertEqual(self.inbox.linked_source("om_member")["sender_id"], "ou_member")
         self.assertEqual(self.config["allowed_open_ids"], [])
 
-    def test_unlisted_group_is_rejected_even_for_personally_paired_user(self):
+    def test_group_quote_of_own_task_needs_no_mention(self):
+        self.assertTrue(self.adapter.handle_event(self.group_event('om_root')))
+        self.adapter.pump_once()
+        reply_id = 'om_group_' + str(len(self.sender.sent))
+        quote = lambda mid, sender='ou_member', mentions=None, parent='om_root': event(
+            mid, sender=sender, chat='oc_team', chat_type='group', text='再补充一点',
+            parent=parent, mentions=mentions)
+        # Quoting someone else's task, @-ing a colleague, or quoting nothing is not for the bot.
+        self.assertFalse(self.adapter.handle_event(quote('om_other', sender='ou_someone')))
+        self.assertFalse(self.adapter.handle_event(quote(
+            'om_colleague', mentions=[{'id': {'open_id': 'ou_colleague'}, 'key': '@_user_1'}])))
+        self.assertFalse(self.adapter.handle_event(quote('om_unrelated', parent='om_not_ours')))
+        self.assertTrue(self.adapter.handle_event(quote('om_quote')))
+        self.assertTrue(self.adapter.handle_event(quote('om_quote_ack', parent=reply_id)))
+
+    def test_unlisted_group_is_rejected_unless_bridge_binds_it(self):
+        calls = []
+        self.bridge.group_join = lambda data: calls.append(data) or {"route": None}
         for sender in ("ou_member", "ou_owner"):
             self.assertFalse(self.adapter.handle_event(
                 self.group_event("om_other_" + sender, sender=sender, chat="oc_other")))
         self.assertEqual(self.inbox.pending(), [])
+        # Only the personally allowed user may ask Bridge to bind a new group.
+        self.assertEqual(calls, [{"chat_id": "oc_other", "sender_id": "ou_owner"}])
 
     def test_group_member_still_needs_bot_mention(self):
         self.assertFalse(self.adapter.handle_event(event(
@@ -260,6 +279,58 @@ class FeishuBridgeTests(unittest.TestCase):
         self.assertEqual(self.bridge.continuations[1], original)
         self.assertEqual([x[1] for x in self.sender.sent], ['received', 'received', '已完成'])
         self.assertIn('Original turn result', self.sender.sent[-1][2])
+
+    def _private_turn(self, message_id, text, thread='th_private'):
+        self.adapter.handle_event(event(message_id, text=text))
+        self.adapter.pump_once()
+        task_id = self.inbox.linked_source(message_id)['task_id']
+        self.bridge.tasks[task_id] = {'status': '已完成', 'result': 'ok', 'thread_id': thread}
+        return self.bridge.submissions[-1][0]
+
+    def test_private_followups_skip_unchanged_policy_then_refresh(self):
+        self.config['prompt_template'] = '长业务规则：先核对事实再回答。\n请求：{{message}}'
+        first = self._private_turn('om_p1', '第一问')
+        self.assertIn('长业务规则', first)
+        sent = [self._private_turn('om_p%d' % i, '追问%d' % i) for i in range(2, 8)]
+        for prompt in sent[:5]:
+            self.assertNotIn('长业务规则', prompt)
+            self.assertIn('助手规则未变', prompt)
+            self.assertIn('沿用本对话最近一次完整版本', prompt)
+        self.assertIn('追问2', sent[0])
+        # The 7th turn resends everything in case the backend compacted early turns.
+        self.assertIn('长业务规则', sent[5])
+        self.assertNotIn('助手规则未变', sent[5])
+        self.assertTrue(all(c for c in self.bridge.continuations[1:]))
+
+    def test_changed_policy_is_resent_in_full(self):
+        self.config['prompt_template'] = '旧规则。\n{{message}}'
+        self._private_turn('om_c1', '第一问')
+        self.assertIn('助手规则未变', self._private_turn('om_c2', '第二问'))
+        self.config['prompt_template'] = '新规则。\n{{message}}'
+        third = self._private_turn('om_c3', '第三问')
+        self.assertIn('新规则', third)
+        self.assertNotIn('助手规则未变', third)
+        self.assertIn('助手规则未变', self._private_turn('om_c4', '第四问'))
+
+    def test_followup_without_known_thread_keeps_full_policy(self):
+        self.config['prompt_template'] = '完整规则。\n{{message}}'
+        self._private_turn('om_n1', '第一问', thread=None)
+        self.assertIn('完整规则', self._private_turn('om_n2', '第二问', thread=None))
+
+    def test_group_reply_skips_unchanged_policy(self):
+        self.config['prompt_template'] = '群业务规则。\n{{message}}'
+        self.adapter.handle_event(self.group_event('om_g1'))
+        self.adapter.pump_once()
+        task_id = self.inbox.linked_source('om_g1')['task_id']
+        self.assertIn('群业务规则', self.bridge.submissions[-1][0])
+        self.bridge.tasks[task_id] = {'status': '已完成', 'result': 'ok', 'thread_id': 'th_group'}
+        self.adapter.handle_event(self.group_event('om_g2', parent='om_g1'))
+        self.adapter.pump_once()
+        prompt, target = self.bridge.submissions[-1]
+        self.assertEqual(target, task_id)
+        self.assertNotIn('群业务规则', prompt)
+        self.assertIn('助手规则未变', prompt)
+        self.assertIn('检查项目', prompt)
 
     def test_custom_prompt_is_frozen_when_message_arrives(self):
         self.config["prompt_template"] = "项目规则：先核对事实。\n请求：{{message}}"

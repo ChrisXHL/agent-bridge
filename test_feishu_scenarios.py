@@ -181,6 +181,7 @@ class FeishuScenarioTests(unittest.TestCase):
         adapter = self.adapter()
         self.assertFalse(adapter.handle_event(event("om_plain", "群里检查", chat="oc_group",
                                                     chat_type="group")))
+        adapter.bridge.group_join = lambda data: {"route": None}  # Bridge declines to bind
         self.assertFalse(adapter.handle_event(event("om_other_group", "@_user_1 群里检查",
                                                     chat="oc_other", chat_type="group", mentions=mention)))
         self.assertTrue(adapter.handle_event(event("om_mentioned", "@_user_1 群里检查",

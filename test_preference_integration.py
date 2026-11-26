@@ -127,11 +127,12 @@ class PreferenceIntegrationTests(unittest.TestCase):
         self.assertIn('当前限定偏好：{}', prompt)
         self.assertNotIn('"language": "zh"', prompt)
 
-    def test_temporary_request_does_not_offer_save(self):
+    def test_temporary_request_is_not_a_persistent_preference(self):
         item = self.receive('om_temporary_pref', '这次简短一点')
         self.adapter.pump_once()
         self.assertNotIn('personal-preference.py', self.bridge.submissions[0][0])
-        self.assertNotIn('update-assistant-self.py', item['prompt'])
+        self.assertIn('单次要求不写进业务规则', item['prompt'])
+        self.assertFalse(json.loads(self.path.read_text()).get('rule_items'))
 
 
 if __name__ == '__main__':

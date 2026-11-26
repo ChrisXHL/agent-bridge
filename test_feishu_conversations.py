@@ -17,10 +17,11 @@ class StoreClient:
         self.store,self.connection=store,connection
         self.lose_receipt=False
 
-    def submit(self,message,request_id,task_id=None,*,continue_from=None):
+    def submit(self,message,request_id,task_id=None,*,continue_from=None,private=False):
         payload={'message':message}
         if task_id:payload['task_id']=task_id
         if continue_from:payload['continue_from']=continue_from
+        if private:payload['private']=True
         result=self.store.submit(self.store.connection(self.connection['id'],reveal=True),payload,request_id)[1]
         if self.lose_receipt:
             self.lose_receipt=False

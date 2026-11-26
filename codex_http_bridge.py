@@ -36,6 +36,68 @@ class RpcError(Exception):
         self.code = code
 
 
+def codex_daemon_socket():
+    """Local patch: with BRIDGE_CODEX_DAEMON=1, talk to the long-running local Codex
+    app-server daemon (WebSocket over its control socket) instead of a private child,
+    so Codex turns outlive a Bridge restart. Returns None when not enabled/available."""
+    if os.getenv("BRIDGE_CODEX_DAEMON", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    path = os.getenv("BRIDGE_CODEX_DAEMON_SOCKET") or str(
+        Path.home() / ".codex/app-server-control/app-server-control.sock")
+    return path if Path(path).exists() else None
+
+
+class _DaemonConnection:
+    """Popen-shaped shim over a WebSocket to the Codex daemon (one JSON message per frame)."""
+    def __init__(self, socket_path):
+        from websockets.sync.client import unix_connect
+        try:
+            self.ws = unix_connect(socket_path, "ws://localhost/", max_size=None, open_timeout=10)
+        except Exception as exc:
+            raise OSError(f"codex daemon unavailable: {type(exc).__name__}") from exc
+        self.closed = False
+        self.stdin = self
+        self.stdout = self._messages()
+        self.stderr = iter(())
+        self.pid = None
+
+    def _messages(self):
+        try:
+            for message in self.ws:
+                yield (message if isinstance(message, str) else message.decode()) + "\n"
+        except Exception:
+            pass
+        finally:
+            self.closed = True
+
+    def write(self, text):
+        for line in text.splitlines():
+            if line.strip():
+                try:
+                    self.ws.send(line)
+                except Exception as exc:
+                    self.closed = True
+                    raise OSError("codex daemon connection closed") from exc
+
+    def flush(self):
+        pass
+
+    def poll(self):
+        return 0 if self.closed else None
+
+    def terminate(self):
+        self.closed = True
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+    kill = terminate
+
+    def wait(self, timeout=None):
+        return 0
+
+
 class AppServerClient:
     def __init__(self, codex_bin="codex", timeout=25, on_server_request=None, experimental_api=False):
         from codex_runtime import resolve_codex_binary
@@ -54,11 +116,19 @@ class AppServerClient:
             if self.proc and self.proc.poll() is None:
                 return
             try:
-                self.proc = subprocess.Popen(
-                    [self.codex_bin, "app-server", "--stdio"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, bufsize=1,
-                )
+                daemon = codex_daemon_socket()
+                self.proc = None
+                if daemon:
+                    try:
+                        self.proc = _DaemonConnection(daemon)
+                    except OSError:
+                        LOG.warning("Codex daemon unavailable; using a private app-server")
+                if self.proc is None:
+                    self.proc = subprocess.Popen(
+                        [self.codex_bin, "app-server", "--stdio"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, bufsize=1,
+                    )
             except OSError as exc:
                 raise BridgeError(503, "codex_unavailable", "Could not start Codex app-server", retryable=True) from exc
             threading.Thread(target=self._read, daemon=True).start()

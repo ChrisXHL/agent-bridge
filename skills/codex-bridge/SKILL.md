@@ -34,6 +34,9 @@ completes official login/QR/tenant approval. Do not assume the service exists
 because the MCP server registered. Inspect a running installation before changes.
 After setup, reuse the existing manager or resume its saved job; do not recreate it.
 
+To add a chat platform other than Feishu/WeChat (Telegram, Slack, DingTalk, ...),
+use the bridge-platform-adapter skill: one file in platforms/, no core edits.
+
 The panel has Tasks, Connections, and Feishu. Incoming allowed text and rich-text
 messages are inserted into the saved Prompt at {{message}}. Images, files, audio
 and video are downloaded with that application's own credentials before task

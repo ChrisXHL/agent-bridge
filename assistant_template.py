@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from codex_http_bridge import BridgeError
+from assistant_rules import rules_text, archive_all as archive_rules
 from assistant_prompt import business_template, is_shared, sync_shared
 from feishu_groups import atomic_write, group_routes
 from feishu_settings import CONFIG_LOCK, load, validate_prompt_template
@@ -44,7 +45,7 @@ def export_template(settings, data):
         assistant = {
             'name': cfg.get('app_name') or cfg.get('bot_name') or '助手',
             'prompt_template': business_template(cfg),
-            'self_update_rule': cfg.get('self_update_rule', ''),
+            'self_update_rule': rules_text(cfg),
             'backend': connection['execution_backend'],
             'workspace_hint': project_name[:100],
         }
@@ -74,6 +75,8 @@ def apply_template(settings, data):
         updated = {**cfg, 'connection_id': connection_id, 'connection_key': connection['api_key'],
                    'group_configs': routes, 'prompt_template': assistant['prompt_template'],
                    'self_update_rule': assistant['self_update_rule']}
+        # The copied rules replace the target's own; keep its items for rollback.
+        archive_rules(updated, 'template_apply')
         atomic_write(path, sync_shared(updated))
         return {'applied': True, 'name': cfg.get('app_name') or cfg.get('bot_name') or '助手',
                 'execution_backend': connection['execution_backend'],

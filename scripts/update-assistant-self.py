@@ -20,17 +20,46 @@ def loopback_url(value):
     return value.rstrip('/')
 
 
+def _number(parser, value):
+    try:
+        number = int(value)
+    except ValueError:
+        parser.error('--replace 的第一个参数必须是规则编号')
+    return number
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bridge-url', type=loopback_url, default='http://127.0.0.1:8797')
     parser.add_argument('--source-id', required=True)
     parser.add_argument('--token', required=True)
-    rule = parser.add_mutually_exclusive_group(required=True)
-    rule.add_argument('--rule')
-    rule.add_argument('--clear', action='store_true')
+    # Shared assistants: itemized rules. Legacy assistants: --rule / --clear.
+    parser.add_argument('--list', action='store_true', help='列出现有规则条目')
+    parser.add_argument('--add', action='append', default=[], metavar='规则', help='新增一条规则，可重复')
+    parser.add_argument('--replace', action='append', nargs=2, default=[], metavar=('编号', '规则'),
+                        help='直接替换第 N 条，可重复')
+    parser.add_argument('--remove', action='append', type=int, default=[], metavar='编号',
+                        help='直接删除第 N 条，可重复')
+    parser.add_argument('--propose', metavar='原因', help='把这些改动作为整理提议，请提出人确认后生效')
+    parser.add_argument('--rule')
+    parser.add_argument('--clear', action='store_true')
     args = parser.parse_args()
-    payload = json.dumps({'source_id': args.source_id, 'token': args.token,
-                          'rule': args.rule or '', 'clear': args.clear}, ensure_ascii=False).encode()
+    ops = ([{'op': 'replace', 'id': _number(parser, n), 'text': t} for n, t in args.replace]
+           + [{'op': 'remove', 'id': n, 'text': ''} for n in args.remove]
+           + [{'op': 'add', 'text': t} for t in args.add])
+    modes = [bool(args.list), bool(ops), args.rule is not None or args.clear]
+    if sum(modes) != 1 or (args.rule is not None and args.clear) or (args.propose is not None and not ops):
+        parser.error('请只选择一种：--list；--add/--replace/--remove；或整段规则 --rule/--clear')
+    body = {'source_id': args.source_id, 'token': args.token}
+    if args.list:
+        body['list'] = True
+    elif ops:
+        body['ops'] = ops
+        if args.propose is not None:
+            body['propose'] = args.propose
+    else:
+        body.update(rule=args.rule or '', clear=args.clear)
+    payload = json.dumps(body, ensure_ascii=False).encode()
     req = request.Request(args.bridge_url + '/api/feishu/assistant-self-update', data=payload,
                           headers={'Content-Type': 'application/json'}, method='POST')
     try:
@@ -47,7 +76,7 @@ def main():
         print(json.dumps({'error': {'code': code, 'message': message}}, ensure_ascii=False), file=sys.stderr)
         return 1
     except OSError:
-        print('无法连接本机 Bridge，规则未更新。', file=sys.stderr)
+        print('未收到 Bridge 保存结果。请使用同样参数重试核对。', file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False))
     return 0

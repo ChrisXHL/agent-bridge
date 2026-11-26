@@ -72,6 +72,17 @@ Codex、Claude Code、使用 DeepSeek 的 Agent，或其他宿主中。先识别
 - 目标环境先创建或接入一位自己的飞书机器人，再选择这位目标机器人和它实际可用的工作文件夹，通过 `/api/feishu/assistant-template/apply` 使用配置。此操作只改目标机器人的默认工作规则和默认文件夹，不更换它的飞书身份、私聊允许名单、群配置或执行工具。目标 Agent 应按当前环境检查并选择合适的执行工具；不能因文件记录了 Claude 或 Codex 就假定目标电脑已经装好、登录好。
 - 复制配置不会停用原机器人，也不会自动创建新机器人。若用户要的是原机器人连同原群迁到新电脑，仍走上面的迁移包流程。
 
+## 新增其他聊天平台
+
+- 用户要接入飞书、微信以外的平台（Telegram、Slack、Discord、钉钉、企业微信等）时，
+  先读 `skills/bridge-platform-adapter/SKILL.md`，按其中的产品、界面和适配器规则做。
+- 一个平台就是一个文件 `platforms/<id>.py`：`./scripts/new-platform <id> <显示名> --mode form|qr`
+  生成骨架，只实现接入、收消息、发消息几个钩子；导航、页面、设置、续聊、新对话、
+  记住、去重都由 `platform_channel.py` 和 `static/platforms.js` 统一提供。
+- 不为单个平台改 `service.py`、`index.html`、`app.js`，也不设计新页面；框架缺能力时
+  改框架并补测试。`./scripts/verify-platform <id>` 通过后，再用真实账号按
+  `references/acceptance.md` 验收。
+
 ## 验证后交付
 
 在隔离的测试配置中先验证所改执行后端，再在用户授权范围内，用无敏感内容的

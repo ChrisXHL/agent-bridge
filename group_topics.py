@@ -120,11 +120,14 @@ class GroupTopics:
                     or cfg.get('assistant_manager') or not cfg.get('bot_open_id')):return None
             if chat in cfg.get('allowed_chat_ids',[]):return {'route':next((r for r in group_routes(cfg) if r['chat_id']==chat),None)}
             if data.get('mentions') is not None and cfg['bot_open_id'] not in data['mentions']:return None
+            # Local patch: anyone on the bot's private allowlist (or its recorded group
+            # owner) may connect it to a group, incl. migrated bots without a creator record.
+            trusted=owner in cfg.get('allowed_open_ids',[]) or owner==cfg.get('auto_group_owner_open_id')
             for job_path in sorted((self.groups.config_path.parent/'assistant-onboarding').glob('asst_*/job.json')):
                 j=load(job_path)
                 if j.get('app_ref')!=ref or j.get('kind')=='manager' or not j.get('plan'):continue
                 credentials=load(job_path.parent/'credentials.json')
-                if (credentials.get('app_id')!=cfg.get('app_id') or credentials.get('owner_open_id')!=owner):return None
+                if (credentials.get('app_id')!=cfg.get('app_id') or credentials.get('owner_open_id')!=owner):break
                 try:check_topic_permissions(cfg['app_id'],cfg['app_secret']);topics=True
                 except BridgeError:topics=False
                 title=data.get('name') or chat_name(cfg['app_id'],cfg['app_secret'],chat)
@@ -140,7 +143,21 @@ class GroupTopics:
                 if j.get('phase')=='waiting_group':
                     self.c.onboarding.update(j['id'],phase='ready',message='已接入群聊，群里 @我说要做什么就行。')
                 return {'route':routes[chat]}
-            return None
+            if not trusted:return None
+            try:prompt=self.groups.group_defaults({'app_ref':ref})['prompt_template']
+            except BridgeError:return None
+            try:check_topic_permissions(cfg['app_id'],cfg['app_secret']);topics=True
+            except BridgeError:topics=False
+            title=data.get('name') or chat_name(cfg['app_id'],cfg['app_secret'],chat)
+            routes={r['chat_id']:r for r in group_routes(cfg)}
+            routes[chat]={'chat_id':chat,'name':title or (cfg.get('app_name') or cfg.get('name') or '助手')+' · 群 '+chat[-6:],
+                          'chat_title':title,'connection_id':connection,'prompt_template':prompt,
+                          'enabled':True,'topic_collaboration':topics}
+            cfg.update(group_configs=routes,allowed_chat_ids=list(routes))
+            from assistant_prompt import sync_shared
+            sync_shared(cfg)
+            atomic_write(path,cfg)
+            return {'route':routes[chat]}
         return None
 
     def join(self,connection,data):
@@ -188,18 +205,27 @@ class GroupTopics:
             self.activate_dispatcher(connection,data)
             db.execute('BEGIN IMMEDIATE')
             ref,cfg,route=self.route_for(connection,chat)
-            found=None
+            found=None;via_reply=False
             for key in (mid,data.get('parent_id'),data.get('root_id')):
                 if key:
                     found=db.execute('SELECT t.* FROM group_topics t JOIN group_topic_aliases a ON a.topic_id=t.id WHERE a.chat_id=? AND a.message_id=?',(chat,key)).fetchone()
-                    if found:break
+                    if found:
+                        via_reply=key!=mid
+                        break
+            eligible={v.get('bot_open_id'):r['connection_id'] for _,v,r in self.routes(chat,receiving=False) if v.get('bot_open_id')}
+            addressed=next((eligible[m] for m in mentions if m in eligible),None)
+            if found and via_reply and addressed and addressed!=found['connection_id'] \
+                    and found['connection_id'] not in {eligible[m] for m in mentions if m in eligible}:
+                # A reply that explicitly @mentions another bot (and not the topic owner)
+                # is addressed to that bot: it opens its own topic instead of being
+                # swallowed by the existing owner as a supplement.
+                found=None
             if found:
                 if found['app_ref']!=ref or found['app_id']!=cfg['app_id']:return {'topic':None,'handled_by_other':True}
                 self.owner_route(found)
                 topic=dict(found)
             else:
-                eligible={v.get('bot_open_id'):r['connection_id'] for _,v,r in self.routes(chat,receiving=False) if v.get('bot_open_id')}
-                owner=next((eligible[m] for m in mentions if m in eligible),None)
+                owner=addressed
                 if owner!=connection:return {'topic':None,'handled_by_other':bool(owner)}
                 ident='topic_'+hashlib.sha256((chat+':'+mid).encode()).hexdigest()[:32]
                 frozen={k:route[k] for k in ('connection_id','prompt_template','name')}
@@ -246,9 +272,17 @@ class GroupTopics:
             alias=db.execute('SELECT 1 FROM group_topic_aliases WHERE chat_id=? AND message_id=? AND topic_id=?',(row['chat_id'],data['message_id'],topic['id'])).fetchone()
         expected='fs_'+hashlib.sha256((row['app_id']+':'+data['message_id']).encode()).hexdigest()[:48]
         if not alias or expected!=data['request_id']:raise BridgeError(403,'topic_forbidden','话题来源不匹配。')
-        payload={'message':data['message'],'request_id':expected}
-        if topic['task_id']:payload['task_id']=topic['task_id']
-        status,result=self.store.submit(connection,payload,expected)
+        with self.store.db() as db:
+            prior=db.execute('SELECT m.task_id,t.status FROM messages m JOIN tasks t ON t.id=m.task_id WHERE m.connection_id=? AND m.request_id=?',
+                             (connection['id'],expected)).fetchone()
+        if prior:
+            # The first submit succeeded but its response was lost; a retry now carries the
+            # topic's task_id, which would change the fingerprint and loop on 409 forever.
+            status,result=200,{'task_id':prior['task_id'],'status':prior['status'],'duplicate':True}
+        else:
+            payload={'message':data['message'],'request_id':expected}
+            if topic['task_id']:payload['task_id']=topic['task_id']
+            status,result=self.store.submit(connection,payload,expected)
         self.attach(connection['id'],{'topic_id':topic['id'],'task_id':result['task_id'],'message_id':data['message_id']})
         return status,result
 

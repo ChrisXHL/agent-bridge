@@ -80,6 +80,7 @@ class FakeAPI:
 
 class AssistantIntakeTests(unittest.TestCase):
     def setUp(self):
+        _env = patch.dict(os.environ); _env.start(); self.addCleanup(_env.stop); os.environ.pop('BRIDGE_WORKSPACE_ROOT', None); os.environ.pop('FEISHU_CONFIG', None)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
         self.home = self.root / 'home'
@@ -137,7 +138,7 @@ class AssistantIntakeTests(unittest.TestCase):
         self.assertEqual(self.writes(), [])
         self.runner.assert_not_called()
         self.assertEqual(set(self.state.iterdir()), before)
-        self.assertFalse((self.home / 'AgentBridge').exists())
+        self.assertFalse((self.home / 'Desktop').exists())
 
     def test_inspect_is_read_only_without_lock_backup_or_profile(self):
         before = set(self.state.iterdir())
@@ -158,7 +159,7 @@ class AssistantIntakeTests(unittest.TestCase):
         app_path = self.api.apps[0]['project_path']
         self.assertEqual(self.api.groups[0]['project_path'], app_path)
         self.assertNotEqual(self.api.groups[1]['project_path'], app_path)
-        self.assertTrue(Path(app_path).is_relative_to(self.home / 'AgentBridge'))
+        self.assertTrue(Path(app_path).is_relative_to(self.home / 'Desktop' / 'Agent Bridge 助手工作区'))
         imported = next(data for path, data in self.api.calls if path.endswith('/migration/import'))
         self.assertEqual(imported['bundle']['apps'][0]['prompt_template'], self.app['prompt_template'])
         cli = next(c for c in self.runner.call_args_list if c.args[0][1:3] == ['config', 'init'])

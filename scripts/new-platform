@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Create platforms/<id>.py from the template.
+
+    ./scripts/new-platform telegram Telegram --mode form
+    ./scripts/new-platform dingtalk 钉钉 --mode qr
+
+Then implement the TODO hooks and run ./scripts/verify-platform <id>.
+Rules: skills/bridge-platform-adapter/SKILL.md
+"""
+import argparse
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+RESERVED = {"feishu", "weixin", "tasks", "connections"}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="新增一个聊天平台接入骨架")
+    ap.add_argument("id", help="小写 ID，例如 telegram、dingtalk、slack")
+    ap.add_argument("label", help="面板显示名，例如 Telegram、钉钉")
+    ap.add_argument("--mode", choices=("form", "qr"), default="form",
+                    help="form=粘贴 token/应用凭证；qr=官方扫码登录")
+    args = ap.parse_args()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{1,23}", args.id) or args.id in RESERVED:
+        sys.exit("ID 需为小写字母开头的 2-24 位字母、数字或下划线，且不能是 %s" % "、".join(sorted(RESERVED)))
+    target = ROOT / "platforms" / (args.id + ".py")
+    if target.exists():
+        sys.exit("%s 已存在，不覆盖" % target.relative_to(ROOT))
+    text = (ROOT / "platforms" / "_template.py").read_text(encoding="utf-8")
+    text = text.replace("__ID__", args.id).replace("__LABEL__", args.label).replace("__MODE__", args.mode)
+    text = text.replace('"""__', '"""', 1)
+    target.write_text(text, encoding="utf-8")
+    print("已创建 %s" % target.relative_to(ROOT))
+    print("下一步：按官方文档实现 bind_form/qr_begin/qr_poll、receive、send_text，"
+          "然后运行 ./scripts/verify-platform %s" % args.id)
+
+
+if __name__ == "__main__":
+    main()

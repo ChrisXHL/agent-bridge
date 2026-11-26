@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+import os
 from unittest.mock import patch
 
 import test_assistant_onboarding as onboarding_fixtures
@@ -23,6 +24,7 @@ from service import Store
 
 class SharedIntegrationTests(unittest.TestCase):
     def setUp(self):
+        _env = patch.dict(os.environ); _env.start(); self.addCleanup(_env.stop); os.environ.pop('BRIDGE_WORKSPACE_ROOT', None); os.environ.pop('FEISHU_CONFIG', None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -177,6 +179,7 @@ class SharedIntegrationTests(unittest.TestCase):
 
 class SharedCreationAndManagerTests(unittest.TestCase):
     def setUp(self):
+        _env = patch.dict(os.environ); _env.start(); self.addCleanup(_env.stop); os.environ.pop('BRIDGE_WORKSPACE_ROOT', None); os.environ.pop('FEISHU_CONFIG', None)
         # No CLI runs: launch/registration are fixture fakes. Only advertise the
         # prerequisites required to enter the isolated creation state machine.
         available = patch('assistant_onboarding.shutil.which', return_value='/isolated/bin/tool')
@@ -275,6 +278,7 @@ class SharedTemplateIntakeTests(unittest.TestCase):
 
 class SharedIdentityIntakeTests(unittest.TestCase):
     def setUp(self):
+        _env = patch.dict(os.environ); _env.start(); self.addCleanup(_env.stop); os.environ.pop('BRIDGE_WORKSPACE_ROOT', None); os.environ.pop('FEISHU_CONFIG', None)
         import test_assistant_intake as fixtures
         self.f = fixtures.AssistantIntakeTests(); self.f.setUp()
         self.addCleanup(self.f.tearDown)

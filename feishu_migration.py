@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from codex_http_bridge import BridgeError
+from assistant_rules import rules_text
 from assistant_prompt import business_template, is_shared, sync_shared
 from feishu_groups import application_paths, atomic_write, group_routes
 from feishu_settings import CONFIG_LOCK, load, validate_prompt_template
@@ -62,7 +63,7 @@ def export_bundle(settings, data):
                 'kind': 'standard',
                 'name': cfg.get('app_name') or cfg.get('bot_name') or cfg['app_id'],
                 'prompt_template': business_template(cfg),
-                'self_update_rule': cfg.get('self_update_rule', ''),
+                'self_update_rule': rules_text(cfg),
                 'self_update_owner_open_id': cfg.get('auto_group_owner_open_id') or '',
                 'allowed_open_ids': cfg.get('allowed_open_ids', []),
                 'project_path': project['path'], 'backend': connection['execution_backend'],
@@ -117,7 +118,7 @@ def import_bundle(settings, data):
                     app.get('backend') not in ('codex', 'claude')):
                 raise BridgeError(400, 'invalid_bundle', '迁移包内容无效')
             validate_prompt_template(app.get('prompt_template'))
-            if (not isinstance(app.get('self_update_rule', ''), str)
+            if (not isinstance(app.get('self_update_rule', ''), str) 
                     or not isinstance(app.get('self_update_owner_open_id', ''), str)
                     or (app.get('self_update_owner_open_id') and
                         not re.fullmatch(r'ou_[A-Za-z0-9_-]{1,125}', app['self_update_owner_open_id']))):

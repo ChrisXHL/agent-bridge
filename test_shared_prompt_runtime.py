@@ -116,13 +116,18 @@ class SharedPromptRuntimeTests(unittest.TestCase):
         self.assertEqual(instruction(load(self.path), self.path, 'om_p2p_member', 'ou_member', 'p2p', None,
                                      '更新规则：以后列出来源'), '')
 
-    def test_paired_user_alone_is_not_verified_shared_owner(self):
+    def test_sole_paired_user_is_shared_owner_without_creator_record(self):
+        # Local patch: migrated assistants lack a creator record; the sole paired
+        # user must still be able to save rules from private chat.
         config = {**self.config}
         config.pop('auto_group_owner_open_id')
-        self.assertIsNone(owner_for(config, verified_only=True))
-        self.assertEqual(owner_for(config), 'ou_owner')
-        self.assertEqual(instruction(config, None, 'om_unverified', 'ou_owner', 'p2p', None,
+        self.assertEqual(owner_for(config, verified_only=True), 'ou_owner')
+        self.assertIn('update-assistant-self.py', instruction(
+            config, None, 'om_unverified', 'ou_owner', 'p2p', None, '更新规则：以后列出来源'))
+        self.assertEqual(instruction(config, None, 'om_other', 'ou_member', 'p2p', None,
                                      '更新规则：以后列出来源'), '')
+        config['allowed_open_ids'] = ['ou_owner', 'ou_member']
+        self.assertIsNone(owner_for(config, verified_only=True))
 
     def test_legacy_consumed_group_receipt_stays_read_only_after_migration(self):
         self.config.pop('prompt_policy_version')

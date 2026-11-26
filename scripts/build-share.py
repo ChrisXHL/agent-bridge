@@ -10,12 +10,13 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 DOCUMENTS=['AGENTS.md','README.md','.env.example','.gitignore','requirements.txt','package.json','package-lock.json','run.sh','.mcp.json','.codex-plugin/plugin.json']
-SCRIPTS=['assistant-intake','unify-assistant-prompts','assistant-call.py','update-assistant-self.py','assistant-schedule.py','personal-preference.py','bridge-setup','launch-mcp','register-assistant.cjs','install-daemon','uninstall-daemon','build-share.py']
+SCRIPTS=['assistant-intake','unify-assistant-prompts','assistant-call.py','update-assistant-self.py','assistant-schedule.py','personal-preference.py','bridge-setup','launch-mcp','register-assistant.cjs','install-daemon','uninstall-daemon','build-share.py','update-weixin-rule.py','new-platform','verify-platform','update-platform-rule.py']
 
 
 def build(output,root=ROOT):
     files=[root/p for p in DOCUMENTS]+[root/'scripts'/p for p in SCRIPTS]
     files += [p for p in root.glob('*.py') if not p.name.startswith('test_')]
+    files += sorted((root/'platforms').glob('*.py'))
     for folder in ('static','skills'):
         files += [p for p in (root/folder).rglob('*') if p.is_file() and p.suffix in ('.html','.js','.css','.md','.yaml','.yml')]
     files=sorted(set(files))

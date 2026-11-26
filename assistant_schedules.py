@@ -261,6 +261,8 @@ def fire_due(inbox, config):
                 if is_shared(config):
                     route['prompt_policy_version'] = 1
                 template = _task_template(config, group, row['chat_type'], row['chat_id'], row['owner_id'])
+                saved_rules = applied_rule(config, row['chat_id'] if row['chat_type'] == 'group' else None)
+                route['saved_rules_digest'] = hashlib.sha256(saved_rules.encode()).hexdigest()
             except BridgeError as exc:
                 db.execute("UPDATE assistant_schedules SET state='error',last_error=? WHERE id=?",
                            (str(exc)[:300], row['id']))

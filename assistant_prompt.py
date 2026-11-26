@@ -47,7 +47,12 @@ def delivery_context(config, chat_type, chat_id, sender_id):
     if chat_type == 'group':
         recipient = ('本条来自群聊。只回复可信来源中的当前群；新建交付资料仅向该群添加 view 权限'
                      '（member-type openchat，chat_id 为 ' + chat_id + '）。'
-                     '不得给创建者私聊、其他群或个人自动转发，不读取或导入私聊记录。')
+                     '不得给创建者私聊、其他群或个人自动转发，不读取或导入私聊记录。'
+                     # Local patch 2026-11-25: an agent sent its chart with
+                     # --reply-in-thread, which turned the user's group message
+                     # into a topic and pulled Bridge's final reply in with it.
+                     '自己往群里发图片、文件或消息时，直接回复原消息，不要加 --reply-in-thread、不要开话题；'
+                     '原消息本身就在话题里时，正常回复会自动留在该话题。')
     elif chat_type == 'p2p':
         recipient = ('本条来自已授权用户私聊。只回复当前用户；新建交付资料仅向当前发言人添加 view 权限'
                      '（member-type openid，open_id 为 ' + sender_id + '）。'

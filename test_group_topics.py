@@ -165,10 +165,10 @@ class TopicTests(unittest.TestCase):
   task=self.main.inbox.linked_source('om_group')['task_id'];self.main.pump_once()
   with self.store.db() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM messages WHERE task_id=?',(task,)).fetchone()[0],1)
  def test_saved_group_rule_changes_do_not_rewrite_existing_topic(self):
-  task,_=self.start();cfg=self.cfg;cfg['group_configs']['oc_shared']['prompt_template']='新规则 {{message}}';atomic_write(self.o.groups.resolve(self.f.source['app_ref'])[1],cfg)
+  task,_=self.start();cfg=self.cfg;cfg['group_configs']['oc_shared']['prompt_template']='替换后的独立业务模板 {{message}}';atomic_write(self.o.groups.resolve(self.f.source['app_ref'])[1],cfg)
   self.assertTrue(self.main.handle_event(self.event('om_frozen',parent='om_group',mention=False)))
   self.assertIn('群用途',self.main.inbox.linked_source('om_frozen')['prompt'])
-  self.assertNotIn('新规则',self.main.inbox.linked_source('om_frozen')['prompt'])
+  self.assertNotIn('替换后的独立业务模板',self.main.inbox.linked_source('om_frozen')['prompt'])
  def test_one_owner_when_multiple_bots_receive_same_group_event(self):
   event=self.event();self.assertTrue(self.main.handle_event(event))
   self.assertFalse(self.adapters[self.f.a['id']].handle_event(event))
@@ -311,6 +311,38 @@ class TopicTests(unittest.TestCase):
   child=self.c.result(session,out['batch_id'])['results'][0]['task_id'];s,_=self.session(child)
   self.c.topics.say(s,{'request_id':'discussion-1','text':'已核实来源。'});self.c.topics.deliver()
   self.assertEqual(self.sent[-1]['app'],self.cfg['app_id']);self.assertIn('由负责人转述',self.sent[-1]['body'])
+ def helper_reply(self,mid,mention_owner=False):
+  helper=self.configs[self.f.a['id']]
+  mentions=[{'id':{'open_id':helper['bot_open_id']},'key':'@crawl','name':'爬虫助手'}]
+  if mention_owner:mentions.append({'id':{'open_id':self.cfg['bot_open_id']},'key':'@bot','name':'主助手'})
+  return events.event(mid,sender='ou_member',chat='oc_shared',chat_type='group',parent='om_group',
+      text='@crawl 你来说说看法',mentions=mentions)
+ def test_reply_mentioning_only_other_bot_goes_to_that_bot(self):
+  task,topic=self.start();crawler=self.adapters[self.f.a['id']]
+  for first,second in ((self.main,crawler),):
+   self.assertFalse(first.handle_event(self.helper_reply('om_ask_helper')))
+   self.assertTrue(second.handle_event(self.helper_reply('om_ask_helper')))
+  self.assertIsNone(self.main.inbox.linked_source('om_ask_helper'))
+  route=json.loads(crawler.inbox.linked_source('om_ask_helper')['route_json'])
+  self.assertNotEqual(route['topic_id'],topic)
+ def test_reply_mentioning_other_bot_helper_first_is_stable(self):
+  task,topic=self.start();crawler=self.adapters[self.f.a['id']]
+  self.assertTrue(crawler.handle_event(self.helper_reply('om_ask_helper2')))
+  self.assertFalse(self.main.handle_event(self.helper_reply('om_ask_helper2')))
+  self.assertIsNone(self.main.inbox.linked_source('om_ask_helper2'))
+ def test_reply_mentioning_owner_and_other_bot_stays_with_owner(self):
+  task,topic=self.start();crawler=self.adapters[self.f.a['id']]
+  self.assertFalse(crawler.handle_event(self.helper_reply('om_both',mention_owner=True)))
+  self.assertTrue(self.main.handle_event(self.helper_reply('om_both',mention_owner=True)))
+  self.assertEqual(json.loads(self.main.inbox.linked_source('om_both')['route_json'])['topic_id'],topic)
+ def test_topic_submit_retry_after_lost_response_is_idempotent(self):
+  task,topic=self.start();row=self.main.inbox.linked_source('om_group')
+  frozen=self.main.inbox.private_submission('group:om_group')['message']
+  import hashlib
+  rid='fs_'+hashlib.sha256((self.cfg['app_id']+':om_group').encode()).hexdigest()[:48]
+  conn=self.store.connection(self.cfg['connection_id'])
+  status,result=self.c.topics.submit(conn,{'topic_id':topic,'message_id':'om_group','message':frozen,'request_id':rid})
+  self.assertEqual(result['task_id'],task);self.assertTrue(result['duplicate'])
  def test_reply_to_helper_discussion_continues_owner_topic(self):
   task,_=self.start();session,_=self.session(task)
   self.c.topics.say(session,{'request_id':'discussion-1','text':'开始分工。'});self.c.topics.deliver();mid=self.sent[-1]['id']
@@ -328,7 +360,7 @@ class TopicTests(unittest.TestCase):
   self.assertEqual(self.main.bridge.topic(topic)['task_id'],task)
   self.fake.complete(self.store.task(task)['thread_id'],'已完成');self.engine.tick();self.main.pump_once()
   self.assertTrue(self.sent);self.assertEqual(self.sent[-1]['chat'],'oc_shared')
-  self.assertEqual(self.sent[-1]['body'],'已完成');self.assertNotIn(task,self.sent[-1]['body'])
+  self.assertEqual(self.sent[-1]['body'],'<at user_id="ou_member"></at> 已完成');self.assertNotIn(task,self.sent[-1]['body'])
  def test_delivery_retry_keeps_event_identity_and_records_reply_alias(self):
   task,topic=self.start();s,_=self.session(task);self.c.topics.say(s,{'request_id':'discussion-1','text':'开始核对。'})
   sender=Sender(self.cfg['app_id'],self.sent);real=sender.send_group;keys=[]

@@ -269,9 +269,15 @@ def adapt_prompt(text, app_id, cli, profile):
     return adapted, bool(unknown)
 
 
-def workspace_map(app, home):
-    safe = re.sub(r'[^\w\-]+', '-', app['name'], flags=re.UNICODE).strip('-')[:40] or 'assistant'
-    base = home / 'AgentBridge' / (safe + '-' + app['app_id'][-8:])
+def workspace_map(app, home, chosen=None):
+    import claude_runtime
+    root = claude_runtime.workspace_root() or home / 'Desktop' / claude_runtime.DEFAULT_WORKSPACE_NAME
+    safe = claude_runtime.assistant_folder_name(app['name'])[:60]
+    # A retry keeps the folder picked the first time; a new import never takes
+    # over an existing folder of the same name.
+    base = Path(chosen) if chosen else root / safe
+    if not chosen and base.exists():
+        base = root / (safe + '-' + app['app_id'][-8:])
     result = {}
     for index, source in enumerate(dict.fromkeys([app['project_path'], *(g['project_path'] for g in app['groups'])])):
         # Source paths are migration hints, never authorization to reuse an
@@ -387,7 +393,8 @@ def intake(file, base='http://127.0.0.1:8797', inspect=False, source_stopped=Fal
                 if owned and saved.get('revision') and current['revision'] != saved['revision']:
                     raise IntakeError('managed_settings_changed')
                 profile, create_profile = profile_for(app, home)
-                mapped = workspace_map(app, home)
+                mapped = workspace_map(app, home, saved.get('workspace') if owned else None)
+                workspace = str(next(iter(mapped.values())))
                 for folder in mapped.values():
                     safe_path(folder)
                     if folder.exists() and not owned:
@@ -420,7 +427,7 @@ def intake(file, base='http://127.0.0.1:8797', inspect=False, source_stopped=Fal
                 if not current:
                     # Persist intent, not ownership. A crash before response means a
                     # later existing app is preserved rather than claimed by guessing.
-                    receipt['apps'][ident] = {'phase': 'importing'}
+                    receipt['apps'][ident] = {'phase': 'importing', 'workspace': workspace}
                     private_json(receipt_path, receipt)
                     try:
                         imported = api.call('/api/feishu/migration/import', {'bundle': {
@@ -436,7 +443,7 @@ def intake(file, base='http://127.0.0.1:8797', inspect=False, source_stopped=Fal
                     ref = imported['created'][0]['ref']
                     imported_catalog = api.call('/api/feishu/catalog')
                     imported_app = next(a for a in imported_catalog['apps'] if a['ref'] == ref and a['app_id'] == ident)
-                    saved = {'ref': ref, 'phase': 'adapting', 'verified': False, 'revision': imported_app['revision']}
+                    saved = {'ref': ref, 'phase': 'adapting', 'verified': False, 'revision': imported_app['revision'], 'workspace': workspace}
                     receipt['apps'][ident] = saved
                     private_json(receipt_path, receipt)
                 else:

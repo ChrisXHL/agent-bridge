@@ -62,13 +62,54 @@ def digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _open_in_terminal(command, tool):
+    if sys.platform != "darwin":
+        raise BridgeError(501, "terminal_unavailable", f"当前系统不支持从面板打开 {tool} 终端对话")
+    script = ["-e", 'tell application "Terminal"', "-e", f"do script {json.dumps(command, ensure_ascii=False)}",
+              "-e", "activate", "-e", "end tell"]
+    try:
+        opened = subprocess.run(["osascript", *script], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BridgeError(503, "terminal_unavailable", "无法打开终端，请检查 Terminal 是否可用") from exc
+    if opened.returncode:
+        LOG.warning("Could not open %s conversation in Terminal: %s", tool, opened.stderr.strip()[:300])
+        raise BridgeError(503, "terminal_unavailable", "无法打开终端，请检查 Terminal 是否可用")
+    return {"opened": True}
+
+
+def open_codex_task_conversation(store, task):
+    """Open a Bridge-owned Codex session in the Codex CLI (codex resume) in Terminal."""
+    thread_id = task.get("thread_id")
+    if not thread_id:
+        raise BridgeError(409, "conversation_not_ready", "任务还没有建立对话")
+    try:
+        thread_id = str(uuid.UUID(thread_id))
+    except (ValueError, TypeError) as exc:
+        raise BridgeError(409, "conversation_unavailable", "对话标识无效") from exc
+    if task["status"] in ("等待 Codex", "执行中"):
+        raise BridgeError(409, "conversation_busy", "Codex 正在执行，完成后再打开对话")
+    try:
+        cwd = Path(store.project(task["project_id"])["path"])
+    except BridgeError:
+        cwd = None
+    if not cwd or not cwd.is_dir():
+        raise BridgeError(409, "project_unavailable", "工作文件夹暂时无法访问，不能打开 Codex 对话")
+    import shutil
+    search = os.pathsep.join([str(Path.home() / ".local/bin"), os.environ.get("PATH", ""), "/opt/homebrew/bin:/usr/local/bin"])
+    codex_bin = shutil.which(os.getenv("CODEX_BIN", "codex"), path=search)
+    if not codex_bin:
+        raise BridgeError(503, "codex_unavailable", "本机找不到 Codex CLI")
+    command = f"cd {shlex.quote(str(cwd))} && {shlex.quote(codex_bin)} resume {shlex.quote(thread_id)}"
+    return _open_in_terminal(command, "Codex")
+
+
 def open_claude_task_conversation(store, task_id):
     """Open a completed Bridge-owned Claude CLI session in Terminal."""
     task = store.task(task_id)
     if task.get("archived"):
         raise BridgeError(409, "historical_task", "这条历史任务没有可打开的对话")
     if task.get("execution_backend") != "claude":
-        raise BridgeError(400, "wrong_backend", "这个任务请直接在 Codex 打开")
+        return open_codex_task_conversation(store, task)
     thread_id = task.get("thread_id")
     if not thread_id:
         raise BridgeError(409, "conversation_not_ready", "任务还没有建立对话")
@@ -283,6 +324,9 @@ class Store:
                 db.execute('ALTER TABLE connections ADD COLUMN status_before_delete TEXT')
             if 'execution_backend' not in {r[1] for r in db.execute('PRAGMA table_info(tasks)')}:
                 db.execute("ALTER TABLE tasks ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'codex'")
+            if 'private' not in {r[1] for r in db.execute('PRAGMA table_info(tasks)')}:
+                # Private-chat tasks are exempt from the per-backend concurrency limit.
+                db.execute("ALTER TABLE tasks ADD COLUMN private INTEGER NOT NULL DEFAULT 0")
             # An interrupted send cannot be replayed safely without a Codex readback.
             db.execute("UPDATE messages SET delivery='uncertain' WHERE delivery='sending'")
             db.execute("""UPDATE tasks SET status='需要你处理', error_code='delivery_uncertain'
@@ -503,13 +547,16 @@ class Store:
                     raise BridgeError(404, 'connection_not_found', '连接不存在')
 
     def submit(self, connection, payload, request_id):
-        if not isinstance(payload, dict) or set(payload) - {"task_id", "message", "request_id", "continue_from"}:
+        if not isinstance(payload, dict) or set(payload) - {"task_id", "message", "request_id", "continue_from", "private"}:
             raise BridgeError(400, "invalid_request", "任务内容格式无效")
         message = payload.get("message")
         if not isinstance(message, str) or not 1 <= len(message.strip()) <= 12000:
             raise BridgeError(400, "invalid_message", "任务内容需为 1 到 12000 字")
         if not isinstance(request_id, str) or not 8 <= len(request_id) <= 128 or not all(x.isalnum() or x in "-_.:" for x in request_id):
             raise BridgeError(400, "invalid_request_id", "request_id 需为 8 到 128 位字母、数字或 -_.:")
+        private = payload.get("private", False)
+        if not isinstance(private, bool):
+            raise BridgeError(400, "invalid_request", "private 需为布尔值")
         requested_task = payload.get("task_id")
         continue_from = payload.get('continue_from')
         if continue_from is not None and (not isinstance(continue_from, str) or not continue_from or len(continue_from)>100 or requested_task):
@@ -561,6 +608,8 @@ class Store:
             db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,'queued',NULL,?,?)",
                        ("msg_" + uuid.uuid4().hex[:20], task_id, cid, request_id, fingerprint, message.strip(), t, t))
             db.execute("UPDATE tasks SET status='等待 Codex',result=NULL,error_code=NULL,updated_at=? WHERE id=?", (t, task_id))
+            if private:
+                db.execute("UPDATE tasks SET private=1 WHERE id=?", (task_id,))
         return 202, {"task_id": task_id, "status": "等待 Codex", "duplicate": False}
 
     def tasks(self):
@@ -824,6 +873,9 @@ class Engine:
                 elif last.get('id'):
                     continue
             state = last.get("status")
+            if (state == 'interrupted' and row['execution_backend'] != 'claude'
+                    and self._auto_continue(row['id'])):
+                continue
             if state == 'interrupted' and (thread.get('status') or {}).get('type') == 'notLoaded':
                 # Another app-server owns the live thread. Its partial persisted
                 # history is not authoritative evidence of an interruption.
@@ -852,11 +904,37 @@ class Engine:
                 if release:
                     release()
 
+    def _auto_continue(self, task_id):
+        """Local patch: a Codex turn cut off by a restart continues in the same thread
+        instead of ending as 已停止. Limited to a few attempts per task."""
+        from codex_http_bridge import codex_daemon_socket
+        from claude_runtime import CONTINUE_NOTE, MAX_RESUMES
+        if not codex_daemon_socket():
+            return False
+        with self.store.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = db.execute('SELECT connection_id,status FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not task or task['status'] not in ('执行中', '需要你处理'):
+                return False
+            used = db.execute('SELECT COUNT(*) FROM messages WHERE task_id=? AND content=?',
+                              (task_id, CONTINUE_NOTE)).fetchone()[0]
+            if used >= MAX_RESUMES:
+                return False
+            t = now()
+            db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,'queued',NULL,?,?)",
+                       ('msg_' + uuid.uuid4().hex[:20], task_id, task['connection_id'],
+                        'auto-continue-' + uuid.uuid4().hex, digest(CONTINUE_NOTE + task_id + str(used)),
+                        CONTINUE_NOTE, t, t))
+            db.execute("UPDATE tasks SET status='等待 Codex',result=NULL,error_code=NULL,updated_at=? WHERE id=?",
+                       (t, task_id))
+        LOG.info('codex task continuing after interruption task=%s attempt=%s', task_id, used + 1)
+        return True
+
     @staticmethod
     def _active_rows(db):
         # An unresolved delivery receipt is not a running turn. Preserve
         # the record; actual Codex approvals still reserve their slot.
-        return db.execute("""SELECT id, COALESCE(execution_backend,'codex') AS backend,
+        return db.execute("""SELECT id, COALESCE(execution_backend,'codex') AS backend, private,
             COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=tasks.id),0) AS depth
             FROM tasks WHERE status IN ('执行中','需要你处理')
             AND NOT (status='需要你处理' AND COALESCE(error_code,'') IN ('delivery_uncertain','assistant_authorization_required','group_question_pending')
@@ -877,7 +955,7 @@ class Engine:
             limits=self._limits(db)
             active={b:0 for b in BACKENDS}
             for r in self._active_rows(db):
-                if r['id'] not in self.archived_tasks and not r['depth']:
+                if r['id'] not in self.archived_tasks and not r['depth'] and not r['private']:
                     b=r['backend'] if r['backend'] in BACKENDS else 'codex'
                     active[b]+=1
         return {'backends':[{'id':b,'name':BACKEND_NAMES[b],'limit':limits[b],'active':active[b]} for b in BACKENDS],
@@ -906,10 +984,10 @@ class Engine:
             active_by_depth={depth:sum(r['id'] not in self.archived_tasks and r['depth']==depth for r in active_rows) for depth in range(1,4)}
             active_by_backend={}
             for r in active_rows:
-                if r['id'] not in self.archived_tasks and not r['depth']:
+                if r['id'] not in self.archived_tasks and not r['depth'] and not r['private']:
                     b=r['backend'] if r['backend'] in BACKENDS else 'codex';active_by_backend[b]=active_by_backend.get(b,0)+1
             limits=self._limits(db)
-            rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,t.execution_backend,c.project_id,
+            rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,t.execution_backend,t.private,c.project_id,
                 COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=t.id),0) AS depth
                 FROM messages m JOIN tasks t ON t.id=m.task_id JOIN connections c ON c.id=t.connection_id
                 WHERE m.delivery='queued' AND (c.status!='已停用' OR EXISTS(SELECT 1 FROM assistant_calls a WHERE a.child_task=t.id))
@@ -923,7 +1001,7 @@ class Engine:
             if self.collaboration and not self.collaboration.may_deliver(dict(row)):continue
             if row['depth']:
                 if active_by_depth.get(row['depth'],0)>=CHILD_SLOTS:continue
-            else:
+            elif not row['private']:
                 backend=row['execution_backend'] if row['execution_backend'] in BACKENDS else 'codex'
                 if active_by_backend.get(backend,0)>=limits[backend]:continue
             if self._deliver_message(dict(row)):
@@ -1066,7 +1144,8 @@ class Engine:
 
 
 def make_handler(store, engine, base_url, allowed_host=None,
-                 feishu_settings_path=None, feishu_supervisor=None, feishu_inbox_path=None):
+                 feishu_settings_path=None, feishu_supervisor=None, feishu_inbox_path=None, weixin=None,
+                 platforms=None):
     static = ROOT / "static"
     if feishu_settings_path and feishu_inbox_path:
         store.feishu_label_config = Path(feishu_settings_path)
@@ -1131,7 +1210,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         raise BridgeError(403, "origin_forbidden", "来源无效")
                 if self.command == "GET" and path in ("/", "/panel"):
                     return self.serve_file(static / "index.html", "text/html; charset=utf-8")
-                if self.command == "GET" and path in ("/static/style.css", "/static/app.js", "/static/feishu-groups.js", "/static/assistants.js"):
+                if self.command == "GET" and path in ("/static/style.css", "/static/app.js", "/static/feishu-groups.js", "/static/assistants.js", "/static/weixin.js", "/static/platforms.js"):
                     mime = "text/css; charset=utf-8" if path.endswith("css") else "application/javascript; charset=utf-8"
                     return self.serve_file(static / path.split("/")[-1], mime)
                 if path == "/healthz" and self.command == "GET":
@@ -1143,6 +1222,53 @@ def make_handler(store, engine, base_url, allowed_host=None,
                     return self.send_json(200,{'product':'codex-bridge','version':VERSION,
                         'source_root':str(ROOT.resolve()),'state_dir':str(Path(store.db_path).resolve().parent),
                         'features':['signed-assistant-source-v1','group-recipient-v1','scheduled-group-handoff-v1','native-group-mention-v1','personal-preferences-v1','task-source-label-v1']})
+                if path == "/api/platforms" or path.startswith("/api/platforms/"):
+                    if allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1"):
+                        raise BridgeError(403, "local_only", "平台设置只能在本机修改")
+                    from platform_channel import handle_api
+                    try:
+                        handled = handle_api(platforms, self.command, path, self.read_json)
+                    except ValueError as exc:
+                        raise BridgeError(400, "invalid_platform_setting", str(exc)) from exc
+                    except RuntimeError as exc:
+                        raise BridgeError(502, "platform_unreachable", str(exc)) from exc
+                    except OSError as exc:
+                        raise BridgeError(502, "platform_unreachable", "无法连接平台服务：%s" % exc) from exc
+                    if handled is None:
+                        raise BridgeError(404, "not_found", "页面不存在")
+                    status_code, payload, extra = handled
+                    if extra:
+                        return self.serve_file(extra["file"], extra["mime"])
+                    return self.send_json(status_code, payload)
+                if path.startswith("/api/weixin"):
+                    if allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1"):
+                        raise BridgeError(403, "local_only", "微信设置只能在本机修改")
+                    if weixin is None:
+                        raise BridgeError(503, "weixin_unavailable", "微信接入未启用")
+                    try:
+                        if path == "/api/weixin" and self.command == "GET":
+                            return self.send_json(200, weixin.status())
+                        if path.startswith("/api/weixin/accounts/") and self.command == "PATCH":
+                            return self.send_json(200, weixin.patch(path.rsplit("/", 1)[-1], self.read_json()))
+                        if path.startswith("/api/weixin/accounts/") and path.endswith("/delete") and self.command == "POST":
+                            return self.send_json(200, weixin.delete(path.split("/")[-2]))
+                        if path == "/api/weixin/login" and self.command == "POST":
+                            return self.send_json(200, weixin.start_login())
+                        if path == "/api/weixin/login/verify" and self.command == "POST":
+                            return self.send_json(200, weixin.submit_verify_code(self.read_json().get("code")))
+                        if path == "/api/weixin/self-update" and self.command == "POST":
+                            return self.send_json(200, weixin.self_update(self.read_json()))
+                        if path == "/api/weixin/qr.png" and self.command == "GET":
+                            if not weixin.qr_path.exists():
+                                raise BridgeError(404, "qr_missing", "二维码不存在")
+                            return self.serve_file(weixin.qr_path, "image/png")
+                    except ValueError as exc:
+                        raise BridgeError(400, "invalid_weixin_setting", str(exc)) from exc
+                    except RuntimeError as exc:
+                        raise BridgeError(502, "weixin_unreachable", str(exc)) from exc
+                    except OSError as exc:
+                        raise BridgeError(502, "weixin_unreachable", "无法连接微信服务：%s" % exc) from exc
+                    raise BridgeError(404, "not_found", "页面不存在")
                 if path.startswith("/api/feishu") and self.command in ("GET", "PATCH", "POST"):
                     if allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1"):
                         raise BridgeError(403, "local_only", "飞书设置只能在本机修改")
@@ -1330,6 +1456,24 @@ def make_handler(store, engine, base_url, allowed_host=None,
                         return self.send_json(200, obj)
                     if self.command == "PATCH":
                         return self.send_json(200, store.update_connection(cid, self.read_json()))
+                if path == "/api/claude-auth" and self.command in ("GET", "POST"):
+                    # Local patch: backup Claude token. Writes only from the local panel; never echoed back.
+                    import claude_auth
+                    if self.command == "POST":
+                        if (allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1")
+                                or self.headers.get('Origin') != base_url):
+                            raise BridgeError(403, 'local_only', '请在本机面板设置备用 Token')
+                        data = self.read_json()
+                        if not isinstance(data, dict) or set(data) - {"token", "clear"}:
+                            raise BridgeError(400, 'invalid_request', '请求内容无效')
+                        if data.get("clear") is True:
+                            claude_auth.clear_token()
+                        else:
+                            try:
+                                claude_auth.save_token(data.get("token") if isinstance(data.get("token"), str) else "")
+                            except ValueError:
+                                raise BridgeError(400, 'invalid_token', 'Token 格式不对：请粘贴 claude setup-token 输出的完整 sk-ant- 开头的内容')
+                    return self.send_json(200, claude_auth.summary())
                 if path == "/api/concurrency" and self.command in ("GET", "POST"):
                     if engine is None:
                         raise BridgeError(503, "engine_unavailable", "任务调度暂不可用")
@@ -1475,12 +1619,20 @@ def main():
     supervisor = MultiFeishuSupervisor(
         feishu_settings_path, Path(args.db).parent / "feishu-inbox.sqlite3", base_url)
     supervisor.start()
+    from weixin_bridge import WeixinChannel
+    weixin = WeixinChannel(Path(args.db).parent, base_url, store)
+    weixin.start()
+    from platform_channel import load_platforms
+    platforms = load_platforms(Path(args.db).parent, base_url, store)
+    for channel in platforms.values():
+        channel.start()
     server = ThreadingHTTPServer(
         ("127.0.0.1", args.port),
         make_handler(store, engine, base_url,
                      feishu_settings_path=feishu_settings_path,
                      feishu_supervisor=supervisor,
-                     feishu_inbox_path=Path(args.db).parent / "feishu-inbox.sqlite3"))
+                     feishu_inbox_path=Path(args.db).parent / "feishu-inbox.sqlite3",
+                     weixin=weixin, platforms=platforms))
     LOG.info("panel at %s", base_url)
     engine.start()
     if server.RequestHandlerClass.collaboration:
@@ -1500,6 +1652,9 @@ def main():
         if server.RequestHandlerClass.onboarding:
             server.RequestHandlerClass.onboarding.stop.set()
         supervisor.close()
+        weixin.close()
+        for channel in platforms.values():
+            channel.close()
         engine.close()
 
 

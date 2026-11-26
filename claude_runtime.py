@@ -50,6 +50,36 @@ def workspace_root():
     return Path(value).expanduser().absolute() if value else None
 
 
+DEFAULT_WORKSPACE_NAME = "Agent Bridge 助手工作区"
+
+
+def assistant_workspace_root(home=None):
+    """Where newly created assistants get their own folder: the configured
+    workspace root, else 「Agent Bridge 助手工作区」 on the Desktop. Created on demand."""
+    root = workspace_root() or Path(home or Path.home()) / "Desktop" / DEFAULT_WORKSPACE_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def assistant_folder_name(name):
+    import re
+    return re.sub(r'[/\\:\x00-\x1f]', '-', str(name or '')).strip('. ') or '飞书助手'
+
+
+def new_assistant_folder(name, taken=(), home=None):
+    """A fresh folder named after the assistant inside the workspace root.
+    Never reuses a folder another project owns or one that already has files."""
+    root, base = assistant_workspace_root(home), assistant_folder_name(name)
+    taken = {str(Path(p)) for p in taken}
+    for index in range(1, 1000):
+        folder = root / (base if index == 1 else "%s %d" % (base, index))
+        if str(folder) in taken or (folder.exists() and (not folder.is_dir() or any(folder.iterdir()))):
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+    raise RuntimeError("no free assistant folder")
+
+
 def permission_settings(mcp_servers=(), cwd=None):
     """mcp_servers are rule prefixes like "mcp__tavily"; "mcp__*" is not a valid rule.
     Edits are allowed in the workspace root and in the folder the task runs in
@@ -97,14 +127,48 @@ def resolve_claude_binary(explicit=None):
     return shutil.which("claude") or "claude"
 
 
-def child_env():
+def base_env():
     env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
     env.setdefault("HOME", str(Path.home()))
     return env
 
 
+def child_env():
+    # Local patch: browser login by default; the panel's backup token takes over
+    # when that login is missing, expired, or just failed authentication.
+    env = base_env()
+    try:
+        import claude_auth
+        token = claude_auth.fallback_token()
+    except Exception:
+        LOG.exception("claude fallback token check failed")
+        token = None
+    if token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    return env
+
+
 def run_structured(prompt, schema, directory, log_path, timeout=240):
     """Tool-less structured JSON generation; replacement for `codex exec --output-schema`."""
+    try:
+        return _run_structured(prompt, schema, directory, log_path, timeout)
+    except ClaudeAuthFailed:
+        import claude_auth
+        if not claude_auth._read_token():
+            raise RuntimeError("claude_exec_failed")
+        claude_auth.mark_login_failed()
+        LOG.warning("claude login failed; retrying structured run with backup token")
+        try:
+            return _run_structured(prompt, schema, directory, log_path, timeout)
+        except ClaudeAuthFailed as exc:
+            raise RuntimeError("claude_exec_failed") from exc
+
+
+class ClaudeAuthFailed(RuntimeError):
+    pass
+
+
+def _run_structured(prompt, schema, directory, log_path, timeout):
     cmd = [resolve_claude_binary(), "-p", "--output-format", "json", "--tools", "",
            "--no-session-persistence", "--json-schema", json.dumps(schema, ensure_ascii=False)]
     model = os.getenv("CLAUDE_MODEL")
@@ -121,9 +185,44 @@ def run_structured(prompt, schema, directory, log_path, timeout=240):
     if (value.get("is_error") and value.get("api_error_status") == 400
             and "Identity verification is required to continue" in str(value.get("result", ""))):
         raise ClaudeIdentityRequired("claude_identity_required")
+    if value.get("is_error"):
+        import claude_auth
+        if claude_auth.is_auth_error(str(value.get("result", ""))):
+            raise ClaudeAuthFailed("claude_auth_failed")
     if p.returncode or value.get("is_error") or not isinstance(value.get("structured_output"), dict):
         raise RuntimeError("claude_exec_failed")
     return value["structured_output"]
+
+
+MAX_RESUMES = int(os.getenv("CLAUDE_MAX_RESUMES", "3"))
+CONTINUE_NOTE = ("（系统说明：上一轮执行因 Bridge 重启或进程意外退出而中断。请先检查已经完成的部分，"
+                 "从中断处继续把原任务做完；不要重复已经完成的对外操作，例如重复发消息、重复创建文档。"
+                 "最终回答仍按原任务要求给出完整结果。）")
+
+
+def _alive(pid, marker):
+    """True if pid is still a Claude process for this session (guards against pid reuse)."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,command="], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except Exception:
+        return True
+    return bool(out) and not out.startswith("Z") and marker in out
+
+
+def _killpg(pid):
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        pass
 
 
 class ClaudeTransport:
@@ -134,6 +233,11 @@ class ClaudeTransport:
         self.path = str(Path(state_dir) / "claude-threads.sqlite3")
         self.lock = threading.Lock()
         self.procs = {}
+        self.interrupting = set()
+        self.auth_retried = set()
+        self.closed = False
+        import claude_auth
+        claude_auth.configure(state_dir)
         with self._db() as db:
             db.executescript("""
             CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, cwd TEXT NOT NULL,
@@ -142,11 +246,15 @@ class ClaudeTransport:
               status TEXT NOT NULL, user_text TEXT NOT NULL, agent_text TEXT, error TEXT,
               started_at REAL NOT NULL, finished_at REAL);
             """)
-            # A turn cannot outlive the service that supervised it.
-            db.execute("UPDATE turns SET status='failed',error='Bridge 重启，Claude Code 执行被中断',finished_at=? "
-                       "WHERE status='inProgress'", (time.time(),))
-            if 'model' not in {row[1] for row in db.execute('PRAGMA table_info(turns)')}:
-                db.execute('ALTER TABLE turns ADD COLUMN model TEXT')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(turns)')}
+            for name, kind in (('model', 'TEXT'), ('pid', 'INTEGER'), ('out_path', 'TEXT'),
+                               ('resumes', 'INTEGER NOT NULL DEFAULT 0')):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE turns ADD COLUMN {name} {kind}')
+        # Local patch: turns run detached and write to files, so they outlive a
+        # Bridge restart. On startup, reattach to live turns and continue lost ones.
+        self.turn_dir = Path(state_dir) / "claude-turns"
+        self.turn_dir.mkdir(mode=0o700, exist_ok=True)
         self.mcp_path = Path(state_dir) / "claude-mcp-servers.json"
         try:
             self.mcp_servers = set(json.loads(self.mcp_path.read_text()))
@@ -155,6 +263,7 @@ class ClaudeTransport:
         self.mcp_checked_at = 0.0
         self.mcp_lock = threading.Lock()
         threading.Thread(target=self.refresh_mcp, daemon=True).start()
+        self.recover()
 
     def _remember_mcp(self, servers):
         with self.mcp_lock:
@@ -225,7 +334,7 @@ class ClaudeTransport:
         worker.start()
         return turn_id
 
-    def _run(self, thread, turn_id, message):
+    def _command(self, thread):
         cmd = [self.claude_bin, "-p", "--output-format", "stream-json", "--verbose",
                "--permission-mode", self.permission_mode,
                "--settings", permission_settings(self._mcp_for_turn(thread["cwd"]), thread["cwd"]),
@@ -236,63 +345,162 @@ class ClaudeTransport:
         cmd += ["--resume", thread["id"]] if thread["session_started"] else ["--session-id", thread["id"]]
         if self.model:
             cmd += ["--model", self.model]
-        status, text, error, last_text = "failed", None, None, None
+        return cmd
+
+    def _run(self, thread, turn_id, message):
+        """Launch one detached attempt of a turn, then follow its output file."""
         try:
-            with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stderr:
+            out_path = self.turn_dir / f"{turn_id}.{int(time.time() * 1000)}.jsonl"
+            with tempfile.TemporaryFile() as stdin, open(out_path, "ab") as out, \
+                    open(out_path.with_suffix(".err"), "ab") as err:
                 stdin.write(message.encode()); stdin.seek(0)
-                proc = subprocess.Popen(cmd, cwd=thread["cwd"], stdin=stdin, stdout=subprocess.PIPE, stderr=stderr,
-                                        env=child_env(), start_new_session=True)
-                with self.lock:
-                    self.procs[turn_id] = proc
-                timer = threading.Timer(TURN_TIMEOUT, self._kill, (proc,))
-                timer.start()
-                result = None
-                try:
-                    for line in proc.stdout:
-                        try:
-                            event = json.loads(line)
-                        except ValueError:
-                            continue
-                        kind = event.get("type")
-                        if kind=='assistant' or (kind=='system' and event.get('subtype')=='init'):
-                            observed=(event.get('message') or {}).get('model') if kind=='assistant' else event.get('model')
-                            if observed:
-                                with self._db() as db:db.execute('UPDATE turns SET model=? WHERE id=?',(observed,turn_id))
-                        if kind == "system" and event.get("subtype") == "init":
-                            self._mark_started(thread["id"])
-                            found = mcp_servers_from_init(event)
-                            if found - self.mcp_servers:
-                                self._remember_mcp(found | self.mcp_servers)
-                        elif kind == "assistant":
-                            parts = (event.get("message") or {}).get("content") or []
-                            chunk = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-                            if chunk.strip():
-                                last_text = chunk
-                        elif kind == "result":
-                            result = event
-                    code = proc.wait()
-                finally:
-                    timer.cancel()
-                if result and not result.get("is_error") and result.get("subtype") == "success":
-                    status, text = "completed", result.get("result") or last_text
-                elif result:
-                    error = result.get("result") or result.get("subtype") or "Claude Code 执行失败"
-                elif code in (-signal.SIGTERM, -signal.SIGKILL):
-                    status, error = "interrupted", "Claude Code 执行被终止"
-                else:
-                    stderr.seek(0)
-                    tail = stderr.read()[-800:].decode(errors="replace").strip()
-                    error = f"Claude Code 退出码 {code}" + (f"：{tail}" if tail else "")
+                proc = subprocess.Popen(self._command(thread), cwd=thread["cwd"], stdin=stdin, stdout=out,
+                                        stderr=err, env=child_env(), start_new_session=True)
+            with self._db() as db:
+                db.execute("UPDATE turns SET pid=?,out_path=? WHERE id=?", (proc.pid, str(out_path), turn_id))
         except Exception as exc:
-            LOG.exception("claude turn crashed turn=%s", turn_id)
-            error = f"无法启动 Claude Code：{type(exc).__name__}"
+            LOG.exception("claude turn could not start turn=%s", turn_id)
+            self._finish(turn_id, "failed", None, f"无法启动 Claude Code：{type(exc).__name__}")
+            return
+        with self.lock:
+            self.procs[turn_id] = proc
+        self._watch(thread, turn_id, str(out_path), proc.pid, proc)
+
+    def _watch(self, thread, turn_id, out_path, pid, proc=None):
+        """Follow a turn's output file until its process ends; works for reattached turns too."""
+        with self._db() as db:
+            started = db.execute("SELECT started_at FROM turns WHERE id=?", (turn_id,)).fetchone()[0]
+        result, last_text, buffer, offset, code = None, None, b"", 0, None
+        try:
+            while True:
+                alive = proc.poll() is None if proc else _alive(pid, thread["id"])
+                with open(out_path, "rb") as f:
+                    f.seek(offset); chunk = f.read(); offset += len(chunk)
+                buffer += chunk
+                *lines, buffer = buffer.split(b"\n")
+                for line in lines:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    kind = event.get("type")
+                    if kind == 'assistant' or (kind == 'system' and event.get('subtype') == 'init'):
+                        observed = (event.get('message') or {}).get('model') if kind == 'assistant' else event.get('model')
+                        if observed:
+                            with self._db() as db:
+                                db.execute('UPDATE turns SET model=? WHERE id=?', (observed, turn_id))
+                    if kind == "system" and event.get("subtype") == "init":
+                        self._mark_started(thread["id"]); thread = {**thread, "session_started": 1}
+                        found = mcp_servers_from_init(event)
+                        if found - self.mcp_servers:
+                            self._remember_mcp(found | self.mcp_servers)
+                    elif kind == "assistant":
+                        parts = (event.get("message") or {}).get("content") or []
+                        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+                        if text.strip():
+                            last_text = text
+                    elif kind == "result":
+                        result = event
+                if self.closed:
+                    return
+                if not alive:
+                    code = proc.wait() if proc else None
+                    break
+                if time.time() - started > TURN_TIMEOUT:
+                    _killpg(pid)
+                time.sleep(0.5)
+        except Exception:
+            LOG.exception("claude turn watcher crashed turn=%s", turn_id)
         finally:
             with self.lock:
                 self.procs.pop(turn_id, None)
         with self._db() as db:
-            db.execute("UPDATE turns SET status=?,agent_text=?,error=?,finished_at=? WHERE id=?",
+            row = db.execute("SELECT status,user_text,resumes FROM turns WHERE id=?", (turn_id,)).fetchone()
+        if not row or row["status"] != "inProgress":
+            return
+        if result and not result.get("is_error") and result.get("subtype") == "success":
+            self._finish(turn_id, "completed", result.get("result") or last_text, None)
+        elif result and self._retry_with_token(thread, turn_id, row, result, last_text):
+            return
+        elif result:
+            self._finish(turn_id, "failed", None, result.get("result") or result.get("subtype") or "Claude Code 执行失败")
+        elif turn_id in self.interrupting:
+            self._finish(turn_id, "interrupted", None, "Claude Code 执行被终止")
+        elif time.time() - started > TURN_TIMEOUT:
+            self._finish(turn_id, "failed", None, "Claude Code 执行超时")
+        elif self._retry_with_token(thread, turn_id, row, {"result": self._err_tail(out_path)}, last_text):
+            return
+        elif row["resumes"] < MAX_RESUMES:
+            # The process vanished without a result (crash, reboot, killed by the
+            # system): continue the same conversation instead of failing the task.
+            self._continue(thread, turn_id, row)
+        else:
+            err = ""
+            try:
+                err = Path(out_path).with_suffix(".err").read_bytes()[-800:].decode(errors="replace").strip()
+            except OSError:
+                pass
+            self._finish(turn_id, "failed", None, "Claude Code 多次中断" + (f"：{err}" if err else ""))
+
+    @staticmethod
+    def _err_tail(out_path):
+        try:
+            return Path(out_path).with_suffix(".err").read_bytes()[-2000:].decode(errors="replace")
+        except OSError:
+            return ""
+
+    def _retry_with_token(self, thread, turn_id, row, result, last_text):
+        """Login failed authentication: rerun this turn once on the backup token."""
+        import claude_auth
+        if turn_id in self.auth_retried or not claude_auth.is_auth_error(str(result.get("result") or "")):
+            return False
+        if not claude_auth._read_token():
+            return False
+        self.auth_retried.add(turn_id)
+        claude_auth.mark_login_failed()
+        with self._db() as db:
+            started = db.execute("SELECT session_started FROM threads WHERE id=?", (thread["id"],)).fetchone()[0]
+        thread = {**thread, "session_started": started}
+        # Nothing ran yet in the usual case; only if output was produced continue instead of resending.
+        message = CONTINUE_NOTE if last_text else row["user_text"]
+        LOG.warning("claude login failed; retrying turn with backup token turn=%s", turn_id)
+        self._run(thread, turn_id, message)
+        return True
+
+    def _continue(self, thread, turn_id, row):
+        with self._db() as db:
+            db.execute("UPDATE turns SET resumes=resumes+1 WHERE id=?", (turn_id,))
+            started = db.execute("SELECT session_started FROM threads WHERE id=?", (thread["id"],)).fetchone()[0]
+        thread = {**thread, "session_started": started}
+        message = CONTINUE_NOTE if started else row["user_text"]
+        LOG.info("claude turn continuing after interruption thread=%s turn=%s", thread["id"], turn_id)
+        self._run(thread, turn_id, message)
+
+    def _finish(self, turn_id, status, text, error):
+        with self._db() as db:
+            db.execute("UPDATE turns SET status=?,agent_text=?,error=?,finished_at=? WHERE id=? AND status='inProgress'",
                        (status, text, error, time.time(), turn_id))
-        LOG.info("claude turn finished thread=%s turn=%s status=%s", thread["id"], turn_id, status)
+        self.interrupting.discard(turn_id)
+        LOG.info("claude turn finished turn=%s status=%s", turn_id, status)
+
+    def recover(self):
+        """Reattach to turns still running from a previous Bridge process; continue lost ones."""
+        with self._db() as db:
+            rows = db.execute("""SELECT t.id,t.pid,t.out_path,th.id AS thread_id,th.cwd,th.session_started
+                FROM turns t JOIN threads th ON th.id=t.thread_id WHERE t.status='inProgress'""").fetchall()
+        for row in rows:
+            thread = {"id": row["thread_id"], "cwd": row["cwd"], "session_started": row["session_started"]}
+            if row["pid"] and row["out_path"] and _alive(row["pid"], row["thread_id"]):
+                LOG.info("claude turn reattached turn=%s pid=%s", row["id"], row["pid"])
+                target, args = self._watch, (thread, row["id"], row["out_path"], row["pid"])
+            elif row["out_path"] and Path(row["out_path"]).exists():
+                # Finished (or died) while Bridge was down: read what it wrote.
+                target, args = self._watch, (thread, row["id"], row["out_path"], row["pid"] or 0)
+            else:
+                with self._db() as db:
+                    full = db.execute("SELECT * FROM turns WHERE id=?", (row["id"],)).fetchone()
+                target, args = self._continue, (thread, row["id"], full)
+            threading.Thread(target=target, args=args, daemon=True).start()
 
     def _mark_started(self, thread_id):
         with self._db() as db:
@@ -300,10 +508,7 @@ class ClaudeTransport:
 
     @staticmethod
     def _kill(proc):
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        _killpg(proc.pid)
 
     def read(self, thread_id):
         with self._db() as db:
@@ -330,8 +535,11 @@ class ClaudeTransport:
             return False
         with self.lock:
             proc = self.procs.get(row["id"])
-        if proc:
-            self._kill(proc)
+        with self._db() as db:
+            pid = db.execute("SELECT pid FROM turns WHERE id=?", (row["id"],)).fetchone()[0]
+        if proc or (pid and _alive(pid, thread_id)):
+            self.interrupting.add(row["id"])
+            _killpg(proc.pid if proc else pid)
             return True
         # No live process (e.g. lost across a restart): close the record directly.
         with self._db() as db:
@@ -346,10 +554,8 @@ class ClaudeTransport:
         pass
 
     def close(self):
-        with self.lock:
-            procs = list(self.procs.values())
-        for proc in procs:
-            self._kill(proc)
+        # Running turns are detached on purpose: the next Bridge process reattaches.
+        self.closed = True
 
 
 class _Closing:

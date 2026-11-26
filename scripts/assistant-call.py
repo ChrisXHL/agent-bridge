@@ -14,7 +14,10 @@ def main():
     sub=p.add_subparsers(dest='action',required=True);sub.add_parser('list')
     call=sub.add_parser('call');call.add_argument('--request-id',required=True);call.add_argument('--file',required=True)
     mention=sub.add_parser('mention');mention.add_argument('--request-id',required=True);mention.add_argument('--text',required=True)
-    target=mention.add_mutually_exclusive_group(required=True);target.add_argument('--assistant-id');target.add_argument('--assistant-name')
+    mention.add_argument('--assistant-id');mention.add_argument('--assistant-name')
+    mention.add_argument('--name',action='append',default=[],help='要@的助手、机器人或群成员名称，可重复')
+    mention.add_argument('--open-id',action='append',default=[],help='要@的 open_id，可重复')
+    mention.add_argument('--all',action='store_true',help='@所有人')
     wait=sub.add_parser('wait');wait.add_argument('--batch',required=True);wait.add_argument('--seconds',type=int,default=60,choices=range(0,61),metavar='0..60')
     for action in ('say','ask'):
         command=sub.add_parser(action);command.add_argument('--request-id',required=True);command.add_argument('--text',required=True)
@@ -29,7 +32,8 @@ def main():
         if a.action=='list':out=request('/v1/assistant-peers')
         elif a.action=='call':out=request('/v1/assistant-calls',{'request_id':a.request_id,'requests':json.loads(Path(a.file).read_text())})
         elif a.action=='mention':
-            target={'assistant_id':a.assistant_id} if a.assistant_id else {'assistant_name':a.assistant_name}
+            target={k:v for k,v in {'assistant_id':a.assistant_id,'assistant_name':a.assistant_name,
+                    'names':a.name,'open_ids':a.open_id,'all':a.all}.items() if v}
             out=request('/v1/assistant-mentions',{'request_id':a.request_id,'text':a.text,**target})
         elif a.action=='say':out=request('/v1/assistant-discussions',{'request_id':a.request_id,'text':a.text})
         elif a.action=='ask':out=request('/v1/assistant-questions',{'request_id':a.request_id,'question':a.text})

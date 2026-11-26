@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from codex_http_bridge import BridgeError
+from assistant_rules import rules_text
 from feishu_settings import CONFIG_LOCK, DEFAULT_PROMPT_TEMPLATE, load, public, save, start_pairing, validate_prompt_template
 from feishu_probe import probe
 from feishu_probe import check_topic_permissions, chat_name
@@ -41,7 +42,7 @@ def group_routes(value):
     if is_shared(value):
         for route in routes:
             route['prompt_template'] = business_template(value)
-            route['self_update_rule'] = value.get('self_update_rule', '')
+            route['self_update_rule'] = rules_text(value)
     return routes
 
 
@@ -302,7 +303,7 @@ class GroupSettings:
             item = public(value)
             item.update(ref=ref, name=value.get('app_name') or value.get('bot_name') or value['app_id'],
                         revision=revision(value),
-                        self_update_rule=value.get('self_update_rule', ''),
+                        self_update_rule=rules_text(value),
                         migration_supported=not (value.get('assistant_manager') or value.get('task_dispatcher')))
             try:
                 connection = self.store.connection(value['connection_id'])
@@ -320,7 +321,7 @@ class GroupSettings:
             for route in group_routes(value):
                 route = {k: route[k] for k in ('chat_id', 'name', 'connection_id', 'prompt_template', 'enabled','topic_collaboration')}
                 from assistant_prompt import is_shared
-                route['self_update_rule'] = (value.get('self_update_rule', '') if is_shared(value) else
+                route['self_update_rule'] = (rules_text(value) if is_shared(value) else
                     value.get('group_configs', {}).get(route['chat_id'], {}).get('self_update_rule', ''))
                 route.update(app_ref=ref, app_name=item['name'], revision=item['revision'],
                              prompt_policy_version=value.get('prompt_policy_version', 0))

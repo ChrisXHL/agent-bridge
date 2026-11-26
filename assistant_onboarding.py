@@ -492,13 +492,12 @@ class AssistantOnboarding:
         with CONFIG_LOCK:
             project=j.get('requested_project') or 'assistant-'+ident[5:21]
             if not j.get('requested_project'):
-                display_name=re.sub(r'[/\\\x00-\x1f]', '-',j['name']).strip('. ') or '飞书助手'
                 projects=load(self.store.projects_path)
                 import claude_runtime
-                folder=Path(j.get('workspace') or ((claude_runtime.workspace_root() or Path(self.store.db_path).parent/'assistant-workspaces')/ident/display_name))
                 # Keep the same directory across retries, including changes to the bot's display name.
-                if not j.get('workspace') and j.get('project_id')==project and project in projects:
-                    folder=Path(projects[project])
+                if j.get('workspace'):folder=Path(j['workspace'])
+                elif j.get('project_id')==project and project in projects:folder=Path(projects[project])
+                else:folder=claude_runtime.new_assistant_folder(j['name'],taken=projects.values())
                 folder.mkdir(parents=True,exist_ok=True)
                 if project in projects and projects[project]!=str(folder):raise ValueError('project collision')
                 j=self.update(ident,workspace=str(folder))

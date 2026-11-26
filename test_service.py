@@ -262,6 +262,24 @@ class BridgeMVPTests(unittest.TestCase):
         self.assertEqual(self.store.task(ids[0])['status'],'已完成')
         self.assertEqual(self.store.task(ids[5])['status'],'执行中')
         self.assertEqual(self.fake.created,6)
+    def test_private_chat_tasks_bypass_and_do_not_consume_concurrency_limit(self):
+        self.engine.max_active=1
+        conn=self.store.authenticate('Bearer '+self.connection['api_key'])
+        _,group1=self.store.submit(conn,{'message':'group job 1'},'request-group-limit-1')
+        _,dm1=self.store.submit(conn,{'message':'dm job 1','private':True},'request-dm-limit-1')
+        _,dm2=self.store.submit(conn,{'message':'dm job 2','private':True},'request-dm-limit-2')
+        _,group2=self.store.submit(conn,{'message':'group job 2'},'request-group-limit-2')
+        for _ in range(5):
+            self.engine.tick()
+        self.assertEqual(self.store.task(group1['task_id'])['status'],'执行中')
+        self.assertEqual(self.store.task(dm1['task_id'])['status'],'执行中')
+        self.assertEqual(self.store.task(dm2['task_id'])['status'],'执行中')
+        self.assertEqual(self.store.task(group2['task_id'])['status'],'等待 Codex')
+        backend=self.store.task(group1['task_id'])['execution_backend']
+        active={b['id']:b['active'] for b in self.engine.concurrency()['backends']}
+        self.assertEqual(active[backend],1)
+        with self.assertRaises(Exception):
+            self.store.submit(conn,{'message':'bad','private':'yes'},'request-dm-limit-bad')
     def test_unresolved_receipt_does_not_consume_execution_slot_or_change_history(self):
         _,old=self.store.submit(self.connection,{'message':'old uncertain receipt'},'request-old-uncertain')
         with self.store.db() as db:

@@ -225,14 +225,17 @@ class AssistantCollaboration:
         topic=self.topics.task_topic(msg['task_id'])
         origin=self.task_origin(msg['task_id'])
         handoff=('''\n【群任务转交】
-用户要求“在群里@另一助手”“发给群内某助手”时，优先使用下方 mention 入口：本助手以自己的身份发送真实@，接收助手独立按自身已保存规则处理并回群；不替对方改业务规则，不强制变为内部子任务。
+需要在群里@任何人或任何助手（用户要求，或你判断需要提醒、交接、请人确认）时，使用下方 mention 入口：本助手以自己的身份发送真实@，接收方独立按自身已保存规则处理并回群；不替对方改业务规则，不强制变为内部子任务。
 需要内部委托并等待子结果时才使用 call/wait。群消息发送成功不等于对方已处理，不能把“收到”说成“已入库”。按原请求编号和内容重试，不重复派发。本入口不增加业务写入或分享权限。
 ''' if origin and origin['chat_type']=='group' else '')
         if origin and origin['chat_type']=='group':
-            handoff += (f'\n群内真实@：`{cli} mention --request-id 稳定唯一编号 --assistant-name 完整助手名称 --text 消息内容`。'
-                        '也可用 --assistant-id 列表中的ID代替名称。本工具只发本群消息，保留双方既有规则；'
+            handoff += (f'\n群内真实@：`{cli} mention --request-id 稳定唯一编号 --name 名称 --text 消息内容`。'
+                        '可以@群里任何人和任何助手/机器人：--name 可重复（助手名或群成员名），--open-id 可重复（直接用 open_id，适合不在 Bridge 的机器人），--all 为@所有人；'
+                        '正文里也可直接写飞书原生标签 <at user_id="open_id">名字</at>。需要时主动@相关的人或助手，不必等用户要求。'
+                        '本工具以本助手身份发本群消息，保留对方既有规则；'
                         'state=sent仅表示飞书消息已发出，pending表示排队重试，uncertain表示发送结果不确定、不要换编号重发，failed/cancelled不是成功。'
-                        '只能@已接入本群且已获协作授权的助手；不得夹带额外原生@标签。\n')
+                        '返回的 recipients 逐个说明对方会不会自动接单；assistant_not_listening 表示对方收不到任务，不能当作已交接。'
+                        '名称无法唯一确定时，返回信息会列出可选名称；改用准确名称或 open_id 重试。\n')
         if origin and origin['scheduled']:
             handoff+='\n【本轮定时执行】主动完成已保存的检索/处理任务；要求群内@交接时用mention，内部委托才用call，不要求用户再 @ 或重发。没有新发现不编造；保留可核实的线索与处理结果供后续去重，失败如实报告。不要再次创建同一定时。\n'
         discussion=(f'''\n【群话题协作】

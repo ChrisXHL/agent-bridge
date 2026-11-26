@@ -76,6 +76,9 @@ class BotMentionReceiveTests(unittest.TestCase):
         self.assertTrue(item['prompt'].startswith('RECEIVER RULES'))
         self.assertIn('接收方自己保存的群规则', item['prompt'])
         self.assertNotIn('SENDER FROZEN', item['prompt'])
+        # A bot's request is answered by a plain reply; a real follow-up (e.g. review) uses mention.
+        self.assertIn('请它审核', item['prompt'])
+        self.assertIn('mention 入口', item['prompt'])
         self.assertNotIn('om_foreign_topic', item['prompt'])
         self.adapter.pump_once()
         self.assertEqual(len(self.bridge.submissions), 1)
@@ -148,6 +151,36 @@ class BotMentionReceiveTests(unittest.TestCase):
                 self.poll([self.history_message(mid, stamp)])
                 self.adapter.pump_once()
                 self.assertEqual(len(self.bridge.submissions), count)
+
+    def test_bot_ping_pong_stops_after_limit_and_person_resets(self):
+        self.poll([])  # first poll only sets the cursor
+        stamp = int(time.time() * 1000) + 1000
+        limit = self.adapter.BOT_STREAK_LIMIT
+        chain = [self.history_message('om_bot_%d' % i, stamp + i) for i in range(limit + 2)]
+        self.poll(chain)
+        for i in range(limit):
+            self.assertIsNotNone(self.inbox.linked_source('om_bot_%d' % i))
+        self.assertIsNone(self.inbox.linked_source('om_bot_%d' % limit))
+        self.assertIsNone(self.inbox.linked_source('om_bot_%d' % (limit + 1)))
+        person = self.history_message('om_person', stamp + 100, sender='ou_owner', sender_type='user', mention=False)
+        self.poll(chain + [person, self.history_message('om_after_person', stamp + 101)])
+        self.assertIsNotNone(self.inbox.linked_source('om_after_person'))
+
+    def test_pushed_bot_mention_is_also_stopped_after_limit(self):
+        stamp = int(time.time() * 1000)
+        limit = self.adapter.BOT_STREAK_LIMIT
+        history = [self.history_message('om_hist_%d' % i, stamp + i) for i in range(limit)]
+        self.sender.list_group_messages = Mock(return_value=SimpleNamespace(
+            success=lambda: True, data=SimpleNamespace(items=history, has_more=False)))
+        mentions = [{'id': {'open_id': 'ou_receiver'}, 'key': '@receiver'}]
+        pushed = event('om_pushed', sender='cli_sender', chat='oc_group', chat_type='group',
+                       text='@receiver 收到', mentions=mentions, sender_type='app')
+        self.assertFalse(self.adapter.handle_event(pushed))
+        self.assertIsNone(self.inbox.linked_source('om_pushed'))
+        person = self.history_message('om_person', stamp + 50, sender='ou_owner', sender_type='user', mention=False)
+        self.sender.list_group_messages.return_value = SimpleNamespace(
+            success=lambda: True, data=SimpleNamespace(items=history + [person], has_more=False))
+        self.assertTrue(self.adapter.handle_event(pushed))
 
     def test_first_poll_does_not_read_or_replay_history_and_later_filters_strictly(self):
         self.poll([self.history_message('om_old_history', 1)])

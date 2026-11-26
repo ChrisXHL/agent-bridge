@@ -93,24 +93,36 @@ class GroupMentionTests(scheduled_fixtures.ScheduledCollaborationTests):
         self.assertEqual(error.exception.code, 'mention_child_forbidden')
         self.assertEqual(self.sent, [])
 
-    def test_target_requires_group_binding_and_authorization(self):
+    def test_any_assistant_member_or_everyone_can_be_mentioned_without_authorization(self):
         _, session = self.start()
-        with self.assertRaises(BridgeError):
-            self.send_mention(session, assistant_name=self.outside['name'])
         self.c.configure_policy({'mode': 'confirm'})
-        with self.assertRaises(BridgeError) as error:
-            self.send_mention(session)
-        self.assertEqual(error.exception.code, 'mention_authorization_required')
-        self.assertEqual(self.sent, [])
+        out = self.send_mention(session, assistant_name=self.outside['name'])
+        self.assertEqual(out['state'], 'sent')
+        self.assertIn('<at user_id="ou_mention_', self.sent[-1]['body'])
+        member_sender = Sender(self.configs[self.source['id']]['app_id'], self.sent)
+        member_sender.list_chat_members = lambda chat: [{'open_id': 'ou_human_1', 'name': '张三'}]
+        with patch.object(self.c.topics, 'sender_factory', return_value=member_sender):
+            out = self.c.mentions.send(session, {'request_id': 'open-mention-002', 'names': ['张三'],
+                'open_ids': ['ou_external_bot'], 'all': True, 'text': '请大家看一下'})
+            self.assertEqual(out['state'], 'sent')
+            body = self.sent[-1]['body']
+            for tag in ('<at user_id="all">', '<at user_id="ou_human_1">张三</at>', '<at user_id="ou_external_bot">'):
+                self.assertIn(tag, body)
+            with self.assertRaises(BridgeError) as error:
+                self.c.mentions.send(session, {'request_id': 'open-mention-003', 'names': ['不存在的人'], 'text': 'x'})
+            self.assertEqual(error.exception.code, 'mention_target_unknown')
+            self.assertIn('张三', str(error.exception))
 
-    def test_changed_request_and_extra_native_tag_are_rejected(self):
+    def test_changed_request_is_rejected_and_inline_native_tag_allowed(self):
         _, session = self.start()
         self.send_mention(session)
         with self.assertRaises(BridgeError) as error:
             self.send_mention(session, text='换一条不同内容')
         self.assertEqual(error.exception.code, 'request_changed')
-        with self.assertRaises(BridgeError):
-            self.send_mention(session, request_id='another-mention-id', text='<at user_id="all">所有人</at>')
+        out = self.c.mentions.send(session, {'request_id': 'inline-mention-id',
+            'text': '<at user_id="all">所有人</at> 注意一下'})
+        self.assertEqual(out['state'], 'sent')
+        self.assertTrue(self.sent[-1]['body'].startswith('<at user_id="all">'))
 
     def test_failed_send_retries_same_stable_id_without_claiming_success(self):
         _, session = self.start()
@@ -125,9 +137,8 @@ class GroupMentionTests(scheduled_fixtures.ScheduledCollaborationTests):
         self.assertEqual(self.sent[0]['key'], out['id'])
         self.assertEqual(self.send_mention(session)['state'], 'sent')
 
-    def test_real_outbox_prevents_receiver_mentioning_ancestor(self):
-        _, session = self.start()
-        out = self.send_mention(session)
+    def receiver_session(self, out):
+        """Deliver a sent @ into the peer's inbox as its own task, like the real receiver."""
         cfg = self.configs[self.peer['id']]
         _, _, path = self.o.groups.resolve(self.peer['app_ref'])
         box = Inbox(path)
@@ -141,10 +152,61 @@ class GroupMentionTests(scheduled_fixtures.ScheduledCollaborationTests):
         box.mark_submitted(out['outbound_id'], created['task_id'])
         self.f.engine.tick()
         context = json.loads((self.c.root / (created['task_id'] + '.json')).read_text())
-        receiver = self.c.authenticate('Bearer ' + context['token'])
+        return self.c.authenticate('Bearer ' + context['token']), box, cfg, created['task_id']
+
+    def test_receiver_can_mention_back_but_chain_is_capped(self):
+        _, session = self.start()
+        out = self.send_mention(session)
+        receiver, _, _, _ = self.receiver_session(out)
+        back = self.c.mentions.send(receiver, {'request_id': 'return-mention-001', 'assistant_name': self.source['name'], 'text': '做完了，交回给你'})
+        self.assertEqual(back['state'], 'sent')
+        from group_mentions import MAX_HOPS
+        with self.store.db() as db:
+            db.execute('UPDATE assistant_group_mentions SET ancestry=? WHERE outbound_id=?',
+                       (json.dumps(['x'] * MAX_HOPS), out['outbound_id']))
         with self.assertRaises(BridgeError) as error:
-            self.c.mentions.send(receiver, {'request_id': 'return-mention-001', 'assistant_name': self.source['name'], 'text': '再派给原助手'})
-        self.assertEqual(error.exception.code, 'mention_cycle')
+            self.c.mentions.send(receiver, {'request_id': 'return-mention-002', 'assistant_name': self.source['name'], 'text': '再来一轮'})
+        self.assertEqual(error.exception.code, 'mention_chain_too_long')
+
+    def test_multi_target_mention_counts_each_branch_separately(self):
+        _, session = self.start()
+        out = self.c.mentions.send(session, {'request_id': 'fanout-mention-01',
+            'names': [self.peer['name'], self.outside['name']], 'text': '你们各做一部分'})
+        with self.store.db() as db:
+            stored = json.loads(db.execute('SELECT ancestry FROM assistant_group_mentions WHERE id=?',
+                                           (out['id'],)).fetchone()[0])
+        self.assertEqual(stored, [self.source['id']])
+        receiver, _, cfg, _ = self.receiver_session(out)
+        self.assertEqual(self.c.mentions.chain(receiver, cfg)[0], [self.source['id'], self.peer['id']])
+
+    def test_recipients_say_whether_each_target_will_pick_up(self):
+        _, session = self.start()
+        out = self.c.mentions.send(session, {'request_id': 'reach-mention-01', 'all': True,
+            'names': [self.peer['name'], self.outside['name']], 'open_ids': ['ou_someone'], 'text': '看一下'})
+        kinds = {r['name']: r['kind'] for r in out['recipients']}
+        self.assertEqual(kinds[self.peer['name']], 'assistant')
+        self.assertEqual(kinds[self.outside['name']], 'assistant_not_listening')
+        self.assertEqual(kinds['所有人'], 'everyone')
+        self.assertEqual(kinds['ou_someone'], 'member_or_external')
+
+    def test_person_interjecting_in_same_task_restarts_the_chain(self):
+        _, session = self.start()
+        out = self.send_mention(session)
+        receiver, box, cfg, task_id = self.receiver_session(out)
+        from group_mentions import MAX_HOPS
+        with self.store.db() as db:
+            db.execute('UPDATE assistant_group_mentions SET ancestry=? WHERE outbound_id=?',
+                       (json.dumps(['x'] * MAX_HOPS), out['outbound_id']))
+        with self.assertRaises(BridgeError):
+            self.c.mentions.send(receiver, {'request_id': 'capped-mention-01', 'assistant_name': self.source['name'], 'text': '再来'})
+        box.accept({'message_id': 'om_user_interjects', 'app_id': cfg['app_id'],
+            'connection_id': cfg['connection_id'], 'chat_id': 'oc_handoff', 'chat_type': 'group',
+            'sender_id': 'ou_real_person', 'text': '继续讨论', 'prompt': '继续',
+            'route_json': '{"mode":"prompt","sender_type":"user"}'})
+        box.mark_submitted('om_user_interjects', task_id)
+        self.assertEqual(self.c.mentions.chain(receiver, cfg)[0], [self.peer['id']])
+        again = self.c.mentions.send(receiver, {'request_id': 'fresh-mention-01', 'assistant_name': self.source['name'], 'text': '用户让继续'})
+        self.assertEqual(again['state'], 'sent')
 
 
 if __name__ == '__main__':

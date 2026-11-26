@@ -14,6 +14,36 @@ LOG = logging.getLogger("codex_bridge.feishu_supervisor")
 ROOT = Path(__file__).resolve().parent
 
 
+_CODE = {"at": 0.0, "value": None}
+_CODE_LOCK = threading.Lock()
+
+
+def code_signature():
+    """Local patch: newest mtime of the package's runtime .py files (tests excluded).
+    Receivers restart by themselves after a code update, without restarting Bridge."""
+    with _CODE_LOCK:
+        if time.monotonic() - _CODE["at"] >= 2:
+            newest = 0
+            for path in ROOT.glob("*.py"):
+                if path.name.startswith("test_"):
+                    continue
+                try:
+                    newest = max(newest, path.stat().st_mtime_ns)
+                except OSError:
+                    pass
+            if newest != _CODE.get("seen"):
+                # Never swap a working receiver for code that cannot even be imported.
+                check = subprocess.run([sys.executable, "-c", "import feishu_worker"], cwd=ROOT,
+                                       capture_output=True, text=True, timeout=60)
+                _CODE["seen"] = newest
+                if check.returncode == 0:
+                    _CODE["value"] = newest
+                else:
+                    LOG.error("Feishu receiver code update rejected: %s", check.stderr[-800:])
+            _CODE["at"] = time.monotonic()
+        return _CODE["value"]
+
+
 class FeishuSupervisor:
     def __init__(self, config_path, state_path, bridge_url):
         self.config_path = Path(config_path)
@@ -84,7 +114,8 @@ class FeishuSupervisor:
         while not self.stop.is_set():
             try:
                 enabled = load(self.config_path).get("enabled", False)
-                signature = self.config_path.stat().st_mtime_ns if self.config_path.exists() else None
+                signature = ((self.config_path.stat().st_mtime_ns if self.config_path.exists() else None),
+                             code_signature())
                 if not enabled:
                     self._halt()
                     self.signature = signature

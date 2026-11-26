@@ -29,6 +29,6 @@
 
 - 组合隔离测试覆盖迁移准备/受控启用/多群目录、去重、只读inspect、profile冲突、symlink、秘密输出与响应不确定等。
 - 模板测试包含真实临时loopback HTTP API：应用后读回默认规则，身份、启用状态、允许名单和项目保持；未发送外部消息。
-- 重复接入应返回 already_present、modified=false，并保留助手原有启用状态；用户迁移文件与本机连接状态不随源码发布。
+- 实际使用用户给出的作图迁移文件重跑：already_present、modified=false。读取原服务显示该助手当前enabled=true、已连接飞书；不是本次重跑替用户启用。
 
 不声称所有Agent后端已兼容，不把配置准备成功当作生图能力或真实聊天执行已验证。

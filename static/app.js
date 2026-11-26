@@ -1,7 +1,7 @@
 const $ = id => document.getElementById(id);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const savedPage=sessionStorage.getItem('bridgePage');
-const state = {page:['tasks','connections','feishu'].includes(savedPage)?savedPage:'tasks', projects:[], connections:[], deletedConnections:[], connectionToRemove:null, connectionChangeBusy:false, feishuConnectionIds:new Set(), feishuConnectionNames:new Set(), feishuCatalogReady:false, feishuCatalogError:'', tasks:[], feishu:null, feishuDirty:false, promptDirty:false, quickDirty:false, newConnection:null, history:false, drawer:null, pending:{setup:false,check:false,pair:false,advanced:false,connection:false,approval:false}};
+const savedPage=window.initialBridgePage=sessionStorage.getItem('bridgePage');
+const state = {page:['tasks','feishu','weixin'].includes(savedPage)?savedPage:'tasks', projects:[], connections:[], deletedConnections:[], connectionToRemove:null, connectionChangeBusy:false, feishuConnectionIds:new Set(), feishuConnectionNames:new Set(), feishuCatalogReady:false, feishuCatalogError:'', tasks:[], feishu:null, feishuDirty:false, promptDirty:false, quickDirty:false, newConnection:null, history:false, drawer:null, pending:{setup:false,check:false,pair:false,advanced:false,connection:false,approval:false}};
 const statusClass = s => ({'等待 Codex':'wait','执行中':'run','流程进行中':'run','等待审核':'need','流程受阻':'need','需要你处理':'need','已完成':'done','失败':'fail','已停止':'fail','待验证':'wait','可用':'done','已停用':'fail'})[s] || 'wait';
 const badge = (s,label=s) => `<span class="status ${statusClass(s)}" title="${esc(s)}"><span class="s-dot"></span>${esc(label)}</span>`;
 const backendName = t => t.execution_backend==='claude'?'Claude':'Codex';
@@ -19,17 +19,14 @@ async function api(path, options={}) {
 function toast(message) { $('toast').textContent=message; $('toast').classList.add('show'); clearTimeout(window.toastTimer); window.toastTimer=setTimeout(()=>$('toast').classList.remove('show'),2500); }
 function feedback(id, message='', tone='info') { const element=$(id); if(element.dataset)delete element.dataset.pollTask; element.textContent=message; element.className='inline-feedback'+(message?' '+tone:' hidden'); }
 function stepState(id, label, tone='') { const element=$(id); element.textContent=label; element.className='step-state'+(tone?' '+tone:''); }
-function switchPage(page) { state.page=page; sessionStorage.setItem('bridgePage',page); for(const name of ['tasks','connections','feishu']) { $(name+'Page').classList.toggle('hidden',page!==name); $('nav'+name[0].toUpperCase()+name.slice(1)).classList.toggle('active',page===name); } $('pageTitle').textContent=({tasks:'任务',connections:'连接',feishu:'飞书',})[page]; $('pageSubtitle').textContent=({tasks:'查看机器人接到的任务与结果。',connections:'管理外部任务来源和工作目录。',feishu:'按账号管理机器人、群和执行工具。'})[page]; $('primaryAction').classList.toggle('hidden',page!=='connections'); $('concurrencyAction').classList.toggle('hidden',page!=='tasks'); if(page==='feishu') renderFeishu();  }
+function switchPage(page) { const extra=window.platformPages||{}; if(!['tasks','connections','feishu','weixin'].includes(page)&&!extra[page]) page='tasks'; state.page=page; sessionStorage.setItem('bridgePage',page); for(const name of ['tasks','connections','feishu','weixin',...Object.keys(extra)]) { $(name+'Page').classList.toggle('hidden',page!==name); $('nav'+name[0].toUpperCase()+name.slice(1)).classList.toggle('active',page===name); } $('pageTitle').textContent=({tasks:'任务',connections:'连接',feishu:'飞书',weixin:'微信'})[page]||extra[page].title; $('pageSubtitle').textContent=({tasks:'查看机器人接到的任务与结果。',connections:'管理外部任务来源和工作目录。',feishu:'按账号管理机器人、群和执行工具。',weixin:'接入微信 ClawBot，在微信里给助手派任务。'})[page]||extra[page].subtitle; $('primaryAction').classList.toggle('hidden',page!=='connections'); $('concurrencyAction').classList.toggle('hidden',page!=='tasks'); $('claudeAuthAction').classList.toggle('hidden',page!=='tasks'); if(page==='feishu') renderFeishu(); if(page==='weixin'&&window.renderWeixin) window.renderWeixin(); if(extra[page]) extra[page].render();  }
 function taskStatus(t){return t.error_code==='assistant_authorization_required'?'等待协作确认':t.error_code==='group_question_pending'?'等待委托助手答复':t.execution_backend==='claude'&&t.status==='等待 Codex'?'等待 Claude Code':t.display_status||t.status;}
 function conversationAction(t,detail=false){
- const label=detail?(t.execution_backend==='claude'?'在终端打开 Claude 对话':'打开 Codex 对话'):'打开对话';
+ const label=detail?(t.execution_backend==='claude'?'在终端打开 Claude 对话':'在终端打开 Codex 对话'):'打开对话';
  const style=detail?'btn ghost':'task-conversation-link';
  if(!t.thread_id)return `<button class="${style}" type="button" disabled title="任务尚未建立对话">${label}</button>`;
- if(t.execution_backend==='claude'){
-  const busy=t.status==='等待 Codex'||t.status==='执行中';
-  return `<button class="${style}" type="button" data-open-conversation="${esc(t.id)}" ${busy?'disabled title="Claude 正在执行，完成后可打开"':''}>${label}</button>`;
- }
- return `<a class="${style}" href="codex://threads/${encodeURIComponent(t.thread_id)}">${label}</a>`;
+ const busy=t.status==='等待 Codex'||t.status==='执行中';
+ return `<button class="${style}" type="button" data-open-conversation="${esc(t.id)}" ${busy?'disabled title="正在执行，完成后可打开"':''}>${label}</button>`;
 }
 function taskRow(t) { return `<div class="task" data-task="${esc(t.id)}"><div class="task-main"><div class="meta-row"><span class="source-chip task-source-label" title="${esc(t.source_label||t.collaborator_name||t.source)}">${esc(t.source_label||t.collaborator_name||t.source)}</span></div><div class="task-title">${esc(t.archive_name||t.title)}</div></div>${taskBadge(t)}<div class="task-tail"><div class="time">${timeText(t.updated_at)}</div>${conversationAction(t)}</div></div>`; }
 function renderTasks() {
@@ -320,7 +317,7 @@ async function nextStep(){
  }catch(e){feedback('connectionFeedback',e.message,'error');}
  finally{state.pending.connection=false;$('nextBtn').disabled=false;$('cancelBtn').disabled=false;if(!state.newConnection)$('nextBtn').textContent='创建连接';}
 }
-document.addEventListener('click',async e=>{ const target=e.target.closest('button,[data-task],a'); if(!target)return; if(target.id==='quickConfirmPair')return quickPair('confirm'); if(target.dataset.page) return switchPage(target.dataset.page); if(target.dataset.openConversation){target.disabled=true;const label=target.textContent;target.textContent='正在打开…';try{await api('/api/tasks/'+encodeURIComponent(target.dataset.openConversation)+'/open-conversation',{method:'POST',body:'{}'});toast('Claude 对话已在终端打开');}catch(err){toast(err.message);}finally{target.disabled=false;target.textContent=label;}return;} if(target.dataset.task) return showTask(target.dataset.task); if(target.dataset.approval){ if(state.pending.approval)return; const taskId=state.drawer?.id; state.pending.approval=true; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=true); feedback('drawerFeedback','正在提交决定…'); try{await api('/api/approvals/'+encodeURIComponent(target.dataset.approval),{method:'POST',body:JSON.stringify({decision:target.dataset.decision})}); state.pending.approval=false; await showTask(taskId,false); feedback('drawerFeedback','决定已提交，任务状态已更新。','success');}catch(err){state.pending.approval=false; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=false); feedback('drawerFeedback',err.message,'error');} return; } if(target.dataset.copy) return copyConnection(target.dataset.copy); if(target.dataset.repath) return showSettings(target.dataset.repath,true); if(target.dataset.settings) return showSettings(target.dataset.settings); if(target.dataset.toggle){ try{const c=state.connections.find(x=>x.id===target.dataset.toggle); await api('/api/connections/'+encodeURIComponent(c.id),{method:'PATCH',body:JSON.stringify({status:c.status==='已停用'?'待验证':'已停用'})}); await refresh(); await showSettings(c.id); toast('连接设置已更新');}catch(err){toast(err.message);} return;} if(target.dataset.savePath){try{await api('/api/projects/'+encodeURIComponent(target.dataset.savePath),{method:'PATCH',body:JSON.stringify({path:$('projectPath').value})}); await refresh(); toast('项目位置已更新');}catch(err){toast(err.message);}return;} if(target.id==='showTechnical'){ $('technicalDetails').classList.toggle('hidden'); return $('projectRepair').classList.toggle('hidden'); } });
+document.addEventListener('click',async e=>{ const target=e.target.closest('button,[data-task],a'); if(!target)return; if(target.id==='quickConfirmPair')return quickPair('confirm'); if(target.dataset.page) return switchPage(target.dataset.page); if(target.dataset.openConversation){target.disabled=true;const label=target.textContent;target.textContent='正在打开…';try{await api('/api/tasks/'+encodeURIComponent(target.dataset.openConversation)+'/open-conversation',{method:'POST',body:'{}'});toast('对话已在终端打开');}catch(err){toast(err.message);}finally{target.disabled=false;target.textContent=label;}return;} if(target.dataset.task) return showTask(target.dataset.task); if(target.dataset.approval){ if(state.pending.approval)return; const taskId=state.drawer?.id; state.pending.approval=true; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=true); feedback('drawerFeedback','正在提交决定…'); try{await api('/api/approvals/'+encodeURIComponent(target.dataset.approval),{method:'POST',body:JSON.stringify({decision:target.dataset.decision})}); state.pending.approval=false; await showTask(taskId,false); feedback('drawerFeedback','决定已提交，任务状态已更新。','success');}catch(err){state.pending.approval=false; document.querySelectorAll('#drawerBody [data-approval]').forEach(button=>button.disabled=false); feedback('drawerFeedback',err.message,'error');} return; } if(target.dataset.copy) return copyConnection(target.dataset.copy); if(target.dataset.repath) return showSettings(target.dataset.repath,true); if(target.dataset.settings) return showSettings(target.dataset.settings); if(target.dataset.toggle){ try{const c=state.connections.find(x=>x.id===target.dataset.toggle); await api('/api/connections/'+encodeURIComponent(c.id),{method:'PATCH',body:JSON.stringify({status:c.status==='已停用'?'待验证':'已停用'})}); await refresh(); await showSettings(c.id); toast('连接设置已更新');}catch(err){toast(err.message);} return;} if(target.dataset.savePath){try{await api('/api/projects/'+encodeURIComponent(target.dataset.savePath),{method:'PATCH',body:JSON.stringify({path:$('projectPath').value})}); await refresh(); toast('项目位置已更新');}catch(err){toast(err.message);}return;} if(target.id==='showTechnical'){ $('technicalDetails').classList.toggle('hidden'); return $('projectRepair').classList.toggle('hidden'); } });
 document.addEventListener('click',async e=>{
  const button=e.target.closest('[data-remove-connection],[data-cancel-remove-connection],[data-confirm-remove-connection],[data-restore-connection]');
  if(!button||state.connectionChangeBusy)return;
@@ -383,7 +380,7 @@ function renderFeishuOverview() {
 
 function concurrencyHtml(c){
  const rows=c.backends.map(b=>`<div class="concurrency-row"><div class="project-info"><strong>${esc(b.name)}</strong><span>正在执行 ${b.active} 个</span></div><div class="concurrency-stepper"><button class="btn" type="button" data-conc-step="-1" data-backend="${esc(b.id)}" aria-label="减少 ${esc(b.name)} 并发">−</button><input class="input" type="number" min="1" max="${c.max}" step="1" id="conc_${esc(b.id)}" value="${b.limit}" aria-label="${esc(b.name)} 最多同时执行"><button class="btn" type="button" data-conc-step="1" data-backend="${esc(b.id)}" aria-label="增加 ${esc(b.name)} 并发">+</button></div></div>`).join('');
- return `<h2 class="detail-title">并发设置</h2><p class="config-help">每个执行工具最多同时执行多少个任务。超出的任务会显示「等待 …」，有空位后按顺序开始。助手之间的协作子任务另有名额，不占用这里的数量。</p><div class="concurrency-list">${rows}</div><p class="config-help">范围 1–${c.max}。调小不会中断正在执行的任务，只影响之后开始的任务。</p><button class="btn primary" type="button" id="saveConcurrency">保存</button>`;
+ return `<h2 class="detail-title">并发设置</h2><p class="config-help">每个执行工具最多同时执行多少个任务。超出的任务会显示「等待 …」，有空位后按顺序开始。私聊消息不受限制、也不占用名额，只有群聊等其他任务排队。助手之间的协作子任务另有名额，不占用这里的数量。</p><div class="concurrency-list">${rows}</div><p class="config-help">范围 1–${c.max}。调小不会中断正在执行的任务，只影响之后开始的任务。</p><button class="btn primary" type="button" id="saveConcurrency">保存</button>`;
 }
 async function showConcurrency(){
  feedback('drawerFeedback');
@@ -397,4 +394,32 @@ async function saveConcurrency(){
  catch(e){feedback('drawerFeedback',e.message,'error');}finally{const b=$('saveConcurrency');if(b)b.disabled=false;}
 }
 $('concurrencyAction').onclick=showConcurrency;
+// Local patch: backup Claude token (claude setup-token) used when the browser login expires or fails.
+function fmtDate(ts){if(!ts)return '未知';const d=new Date(ts*1000);return d.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'})+' '+d.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});}
+function claudeAuthHtml(a){
+ const l=a.login,t=a.token,now=Date.now()/1000;
+ const loginText=!l.checked?'暂时无法读取登录状态':(!l.logged_in?'未登录':(l.usable?`已登录，到期 ${fmtDate(l.expires_at)}`:`已过期或刚刚登录失败（到期 ${fmtDate(l.expires_at)}）`));
+ const tokenDays=t.expires_at?Math.floor((t.expires_at-now)/86400):null;
+ const tokenText=!t.configured?'未设置':(tokenDays!==null&&tokenDays<0?`已设置，按保存时间估算已过期（${fmtDate(t.expires_at)}）`:`已设置，预计 ${fmtDate(t.expires_at)} 到期${tokenDays!==null&&tokenDays<30?`（还剩 ${tokenDays} 天，请尽快更新）`:''}`);
+ const using=a.using_token?'<p class="inline-feedback error">现在正在使用备用 Token 运行。终端执行 <code>claude auth login</code> 重新登录后会自动切回。</p>':'<p class="config-help">现在使用浏览器登录运行。</p>';
+ return `<h2 class="detail-title">Claude 登录</h2><p class="config-help">平时使用浏览器登录（<code>claude auth login</code>）。登录到期、未登录或执行时认证失败，Claude 任务会自动改用这里的备用 Token，并把认证失败的那次任务用 Token 重跑一次。备用 Token 不支持 Claude.ai 连接器（如 Claude Docs），其他功能不受影响。</p>
+ <div class="concurrency-list"><div class="concurrency-row"><div class="project-info"><strong>浏览器登录</strong><span>${esc(loginText)}</span></div></div><div class="concurrency-row"><div class="project-info"><strong>备用 Token</strong><span>${esc(tokenText)}</span></div></div></div>${using}
+ <label for="claudeTokenInput">${t.configured?'更换备用 Token':'设置备用 Token'}</label><input class="input" id="claudeTokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 claude setup-token 输出的 sk-ant-… Token">
+ <p class="config-help">在终端运行 <code>claude setup-token</code>，按提示授权后复制输出的 Token 粘贴到这里。Token 只保存在本机（仅你的账户可读），不会显示、导出或写进配置包。有效期约 1 年。</p>
+ <button class="btn primary" type="button" id="saveClaudeToken">保存</button>${t.configured?' <button class="btn" type="button" id="clearClaudeToken">删除备用 Token</button>':''}`;
+}
+async function showClaudeAuth(){
+ feedback('drawerFeedback');
+ try{const a=await api('/api/claude-auth');openOverlay('claudeAuth','Claude 登录',claudeAuthHtml(a));}catch(e){toast(e.message);}
+}
+async function saveClaudeAuth(body,okText){
+ feedback('drawerFeedback','正在保存…');
+ try{const a=await api('/api/claude-auth',{method:'POST',body:JSON.stringify(body)});openOverlay('claudeAuth','Claude 登录',claudeAuthHtml(a));feedback('drawerFeedback',okText,'success');}
+ catch(e){feedback('drawerFeedback',e.message,'error');}
+}
+$('claudeAuthAction').onclick=showClaudeAuth;
+document.addEventListener('click',e=>{const t=e.target.closest('button');if(!t)return;
+ if(t.id==='saveClaudeToken'){const v=$('claudeTokenInput').value.trim();if(!v)return feedback('drawerFeedback','请先粘贴 Token','error');$('claudeTokenInput').value='';return saveClaudeAuth({token:v},'已保存。登录失效时会自动使用这个 Token。');}
+ if(t.id==='clearClaudeToken'){if(!confirm('删除备用 Token？之后登录失效时 Claude 任务会直接失败。'))return;return saveClaudeAuth({clear:true},'已删除备用 Token。');}
+});
 document.addEventListener('click',e=>{const t=e.target.closest('button');if(!t)return;if(t.id==='saveConcurrency')return saveConcurrency();if(t.dataset.concStep){const input=$('conc_'+t.dataset.backend);const max=state.concurrency?.max||20;input.value=Math.min(max,Math.max(1,(Number(input.value)||1)+Number(t.dataset.concStep)));}});
