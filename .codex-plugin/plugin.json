@@ -1,15 +1,15 @@
 {
   "name": "codex-bridge-v2",
   "version": "2.6.2",
-  "description": "Local Feishu-to-Codex tasks controlled by editable prompts",
+  "description": "Let your agent take root in every app you use and grow into a personal agent that knows you",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Agent Bridge",
-    "shortDescription": "外部任务连接器",
-    "longDescription": "接收飞书消息，填入可编辑 Prompt，在 Codex 任务中执行并回复结果。",
+    "shortDescription": "让 Agent 在每个软件里生根发芽",
+    "longDescription": "把本机的 Claude Code、Codex 等 Agent 接到飞书、微信等聊天软件：在哪里说话就在哪里接活和交付，记住你的规则和偏好，最后长成一个懂你的个人 Agent。",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": [

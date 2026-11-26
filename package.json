@@ -2,7 +2,7 @@
   "name": "agent-bridge",
   "private": true,
   "version": "2.6.2",
-  "description": "Local Feishu bot onboarding for Codex Bridge",
+  "description": "Agent Bridge: let your agent take root in every app and grow into a personal agent that knows you",
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.76.0",
     "qrcode": "1.5.4"
