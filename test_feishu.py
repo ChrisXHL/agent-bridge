@@ -13,6 +13,7 @@ from feishu_settings import DEFAULT_PROMPT_TEMPLATE, complete_pairing, load, ren
 from feishu_probe import probe
 from feishu_worker import BridgeClient, FeishuAdapter, Inbox
 from service import Store, make_handler
+from assistant_prompt import AUTONOMY_PRINCIPLES
 
 
 class FakeBridge:
@@ -128,6 +129,21 @@ class FeishuBridgeTests(unittest.TestCase):
             text="@_user_1 hi", mentions=[{"id":{"open_id":"ou_someone"},"key":"@_user_1"}])))
         self.assertEqual(self.sender.sent,[])
 
+    def test_bare_group_mention_gets_hint_not_silence(self):
+        bare = lambda mid, chat='oc_team': event(
+            mid, sender='ou_member', chat=chat, chat_type='group', text='@_user_1 ',
+            mentions=[{'id': {'open_id': 'ou_bot'}, 'key': '@_user_1'}])
+        self.assertTrue(self.adapter.handle_event(bare('om_bare')))
+        self.assertEqual(self.inbox.pending(), [])
+        self.assertEqual(self.bridge.tasks, {})
+        self.assertEqual(len(self.sender.sent), 1)
+        self.assertEqual(self.sender.sent[0][:2], ('om_bare', 'bare_mention'))
+        self.assertIn('引用', self.sender.sent[0][2])
+        # Unbound groups still get nothing.
+        self.bridge.group_join = lambda data: {'route': None}
+        self.assertFalse(self.adapter.handle_event(bare('om_bare_other', chat='oc_other')))
+        self.assertEqual(len(self.sender.sent), 1)
+
     def test_group_membership_does_not_grant_private_access(self):
         self.assertTrue(self.adapter.handle_event(self.group_event("om_group_access")))
         self.assertFalse(self.adapter.handle_event(event("om_dm", sender="ou_member")))
@@ -140,9 +156,25 @@ class FeishuBridgeTests(unittest.TestCase):
         self.bridge.tasks[tid] = {"status":"已完成", "result":"done"}
         self.adapter.pump_once()
         reply = self.inbox.linked_source("om_original")["outbound_id"]
+        # Another member quoting the task and @-ing the bot starts their own task
+        # with the quoted result as context; it never continues the original one.
         for parent in ("om_original", reply):
-            self.assertFalse(self.adapter.handle_event(
-                self.group_event("om_hijack_" + parent, sender="ou_other", parent=parent)))
+            self.assertTrue(self.adapter.handle_event(
+                self.group_event("om_quote_" + parent, sender="ou_other", parent=parent)))
+            self.adapter.pump_once()
+            quoted = self.inbox.linked_source("om_quote_" + parent)
+            self.assertNotEqual(quoted["task_id"], tid)
+            self.assertIsNone(quoted["parent_id"])
+            self.assertIn("原结果：done", self.bridge.submissions[-1][0])
+            self.assertIsNone(self.bridge.continuations[-1])
+        # Without @ a quote of someone else's task is still ambient chat.
+        self.assertFalse(self.adapter.handle_event(event(
+            "om_quote_no_mention", sender="ou_other", chat="oc_team", chat_type="group",
+            text="补充", parent=reply)))
+        # A different group's task is never imported as context.
+        self.config["allowed_chat_ids"].append("oc_other_allowed")
+        self.assertFalse(self.adapter.handle_event(self.group_event(
+            "om_cross_quote", sender="ou_other", chat="oc_other_allowed", parent=reply)))
         self.assertTrue(self.adapter.handle_event(self.group_event("om_own_reply", parent=reply)))
         self.adapter.pump_once()
         self.assertEqual(self.inbox.linked_source("om_own_reply")["task_id"], tid)
@@ -165,7 +197,7 @@ class FeishuBridgeTests(unittest.TestCase):
         self.adapter.pump_once()
         self.assertEqual(len(self.bridge.requests), 1)
         self.assertTrue(self.bridge.submissions[0][0].startswith(
-            DEFAULT_PROMPT_TEMPLATE.replace("{{message}}", "检查项目") + "\n\n[Codex Bridge 来源信息"))
+            DEFAULT_PROMPT_TEMPLATE.replace("{{message}}", "检查项目") + AUTONOMY_PRINCIPLES + "\n\n[Codex Bridge 来源信息"))
         self.assertIn('"source_message_id": "om_first"', self.bridge.submissions[0][0])
         task_id = self.inbox.submitted()[0]["task_id"]
         self.bridge.tasks[task_id] = {"status": "已完成", "result": "完成核验"}
@@ -338,7 +370,7 @@ class FeishuBridgeTests(unittest.TestCase):
         self.config["prompt_template"] = "修改后的规则：{{message}}"
         self.adapter.pump_once()
         self.assertTrue(self.bridge.submissions[0][0].startswith(
-            "项目规则：先核对事实。\n请求：检查项目\n\n[Codex Bridge 来源信息"))
+            "项目规则：先核对事实。\n请求：检查项目" + AUTONOMY_PRINCIPLES + "\n\n[Codex Bridge 来源信息"))
 
     def test_prompt_respects_bridge_request_size(self):
         with self.assertRaises(BridgeError):
@@ -601,7 +633,7 @@ class FeishuBridgeTests(unittest.TestCase):
             adapter.pump_once()
             linked = self.inbox.submitted()[0]
             self.assertTrue(store.task(linked["task_id"])["messages"][0]["content"].startswith(
-                "固定规则\n执行检查\n\n[Codex Bridge 来源信息"))
+                "固定规则\n执行检查" + AUTONOMY_PRINCIPLES + "\n\n[Codex Bridge 来源信息"))
         finally:
             server.shutdown()
             server.server_close()

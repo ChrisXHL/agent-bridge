@@ -101,8 +101,9 @@ class MediaTests(unittest.TestCase):
   import hashlib
   folder=Path(self.box.path).parent/'attachments'/hashlib.sha256(b'cli_test:om_media').hexdigest();folder.mkdir(parents=True);target=Path(self.box.path).parent/'sensitive';target.write_text('keep');(folder/'01-image.png').symlink_to(target)
   self.adapter.handle_event(self.event());self.adapter.pump_once();self.assertEqual(target.read_text(),'keep');self.assertEqual(self.media()['state'],'failed');self.assertEqual(self.downloads,[])
- def test_media_does_not_impersonate_manager_or_pairing_confirmation(self):
-  self.f.config['assistant_manager']={'admin_open_id':'ou_owner'};self.adapter.handle_event(self.event());self.adapter.pump_once();self.assertIn('对应的业务助手',self.sender.sent[-1][2]);self.assertEqual(self.downloads,[]);self.assertEqual(self.bridge.submissions,[])
+ def test_admin_media_to_manager_runs_as_agent_task(self):
+  # The manager no longer refuses attachments; it hands them to the full agent.
+  self.f.config['assistant_manager']={'admin_open_id':'ou_owner'};self.adapter.handle_event(self.event());self.adapter.pump_once();self.assertEqual(self.downloads,[('om_media','img_fixture','image')]);self.assertEqual(len(self.bridge.submissions),1);self.assertIn('01-image.png',self.bridge.submissions[0][0]);self.assertNotIn('对应的业务助手',self.sender.sent[-1][2])
  def test_reply_after_failed_media_does_not_wait_forever(self):
   self.adapter.handle_event(self.event('file',{}));self.adapter.pump_once()
   self.adapter.handle_event(fixtures.event('om_retry',text='重新说明要求',parent='om_media'));self.adapter.pump_once();self.assertEqual(len(self.bridge.submissions),1)

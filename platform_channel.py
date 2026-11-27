@@ -33,6 +33,7 @@ import time
 import uuid
 from pathlib import Path
 from urllib import error, request
+from assistant_prompt import autonomy_principles
 
 LOG = logging.getLogger("codex_bridge.platform")
 ROOT = Path(__file__).resolve().parent
@@ -596,7 +597,7 @@ class PlatformChannel:
             return self._send(row, "好的，已开始新对话。", a)
         self._connection(a["id"])
         a = self.account(a["id"])
-        message = (a.get("prompt") or "{{message}}").replace("{{message}}", row["text"]) + self._rule_instruction(a, row)
+        message = (a.get("prompt") or "{{message}}").replace("{{message}}", row["text"]) + autonomy_principles() + self._rule_instruction(a, row)
         payload = {"message": message[:12000],
                    "request_id": (self.ID[:6] + "-" + re.sub(r"[^\w.:-]", "", row["message_id"]))[-100:],
                    "private": row["chat_type"] != "group"}

@@ -10,6 +10,7 @@ from feishu_worker import FeishuAdapter, Inbox
 from service import Store, Engine
 from test_feishu import FakeSender, event
 from test_service import FakeTransport
+from assistant_prompt import AUTONOMY_PRINCIPLES
 
 
 class StoreClient:
@@ -186,6 +187,13 @@ class ConversationTests(unittest.TestCase):
         self.assertTrue(follow['messages'][0]['content'].startswith('新的规则：'))
 
     def test_near_limit_request_is_kept_complete_when_context_is_added(self):
+        # The shared principles are static policy that compact follow-ups omit;
+        # stub them so this test still exercises the original length boundary.
+        from unittest import mock
+        with mock.patch('feishu_worker.autonomy_principles', return_value=''):
+            self._near_limit_request_is_kept_complete()
+
+    def _near_limit_request_is_kept_complete(self):
         self.complete(self.receive('om_1','前文'))
         # Valid original intake, with little room for continuity metadata.
         text='a'*11840

@@ -126,6 +126,8 @@ class GroupSettings:
         self.account_identity = AccountIdentity()
         self.account_labels_path = self.config_path.parent / 'feishu-account-labels.json'
         self.account_archives_path = self.config_path.parent / 'feishu-account-archives.json'
+        self.bot_archives_path = self.config_path.parent / 'feishu-bot-archives.json'
+        self.onboarding = None  # set by AssistantOnboarding so created assistants keep one removal path
         self.recover_account_archives()
 
     def account_archives(self):
@@ -347,6 +349,7 @@ class GroupSettings:
                                        'app_count': len(record['apps']), 'group_count': record['group_count'],
                                        'state': record['state']}
                                       for account_id, record in self.account_archives().items()],
+                'removed_apps': self.removed_apps(),
                 'execution_cli': {'name': '按机器人选择', 'options': ['codex', 'claude']},
                 'capabilities': {'group_topics': True}}
 
@@ -412,6 +415,102 @@ class GroupSettings:
                 raise BridgeError(409, 'bot_not_ready', '机器人尚未在飞书启用并发布，请先完成飞书设置')
             if value.get('enabled') != data['enabled']:
                 atomic_write(path, {**value, 'enabled': data['enabled']})
+            return self.catalog()
+
+    # ---- per-bot delete (recoverable archive, same semantics as 移除助手) ----
+    def bot_archives(self):
+        try:
+            value = load(self.bot_archives_path)
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _onboarding_job(self, ref):
+        root = self.config_path.parent / 'assistant-onboarding'
+        for path in sorted(root.glob('asst_*/job.json')):
+            job = load(path)
+            if job.get('app_ref') == ref and job.get('phase') in ('ready', 'removed', 'removing', 'restoring'):
+                return job
+        return None
+
+    def removed_apps(self):
+        items = []
+        for ref, path, _ in application_paths(self.config_path, self.inbox_path):
+            value = load(path)
+            if not value.get('app_id') or not value.get('assistant_archived') or value.get('account_archived'):
+                continue
+            items.append({'ref': ref, 'name': value.get('app_name') or value.get('bot_name') or value['app_id']})
+        return items
+
+    def _removal_blockers(self, ref, value, inbox):
+        ids = {value.get('connection_id')} | {r['connection_id'] for r in group_routes(value)}
+        ids.discard(None); ids.discard('')
+        for other_ref, other, _ in application_paths(self.config_path, self.inbox_path):
+            if other_ref == ref: continue
+            o = load(other)
+            if ids & ({o.get('connection_id')} | {r['connection_id'] for r in group_routes(o)}):
+                raise BridgeError(409, 'shared_connection', '这个机器人和其他机器人共用了连接，请先分开连接再删除。')
+        with self.store.db() as db:
+            if any(db.execute("SELECT 1 FROM tasks WHERE connection_id=? AND status NOT IN ('已完成','失败','已停止') LIMIT 1",
+                              (cid,)).fetchone() for cid in ids):
+                raise BridgeError(409, 'bot_busy', '这个机器人还有未结束的任务，请处理完后再删除。')
+        if inbox.exists() and (any(json.loads(x.get('route_json') or '{}').get('mode', 'prompt') == 'prompt'
+                                   for x in Inbox(inbox).pending()) or Inbox(inbox).submitted()):
+            raise BridgeError(409, 'bot_busy', '这个机器人还有待处理消息，请处理完后再删除。')
+        return ids
+
+    def remove_app(self, data):
+        if not isinstance(data, dict) or set(data) != {'app_ref', 'revision'}:
+            raise BridgeError(400, 'invalid_request', '删除机器人请求无效')
+        with CONFIG_LOCK:
+            ref = data['app_ref']
+            _, path, inbox = self.resolve(ref)
+            value = load(path)
+            self._expected(value, data)
+            job = self._onboarding_job(ref)
+            if job and self.onboarding is not None:
+                self.onboarding.lifecycle(job['id'], 'remove')
+                return self.catalog()
+            ids = self._removal_blockers(ref, value, inbox)
+            archives = self.bot_archives()
+            archives[ref] = {'app_id': value['app_id'], 'enabled': value.get('enabled', False),
+                             'connections': {cid: self.store.connection(cid)['status'] for cid in ids}}
+            atomic_write(self.bot_archives_path, archives)
+            value.update(enabled=False, assistant_archived='bot:' + ref)
+            atomic_write(path, value)
+            for cid in ids:
+                self.store.update_connection(cid, {'status': '已停用'})
+            return self.catalog()
+
+    def restore_app(self, data):
+        if not isinstance(data, dict) or set(data) != {'app_ref'} or not isinstance(data['app_ref'], str):
+            raise BridgeError(400, 'invalid_request', '恢复机器人请求无效')
+        with CONFIG_LOCK:
+            ref = data['app_ref']
+            _, path, _ = self.resolve(ref)
+            value = load(path)
+            marker = value.get('assistant_archived')
+            if not marker:
+                return self.catalog()
+            if value.get('account_archived'):
+                raise BridgeError(409, 'account_removed', '所属飞书账号已移除，请先恢复账号。')
+            if isinstance(marker, str) and marker.startswith('asst_'):
+                if self.onboarding is None:
+                    raise BridgeError(503, 'onboarding_unavailable', '助手管理暂不可用，请稍后重试')
+                self.onboarding.lifecycle(marker, 'restore')
+                return self.catalog()
+            archives = self.bot_archives()
+            record = archives.get(ref) or {'enabled': False, 'connections': {}}
+            if record.get('app_id') not in (None, value.get('app_id')):
+                raise BridgeError(409, 'settings_changed', '机器人配置已变化，请先核对。')
+            for cid, status in record.get('connections', {}).items():
+                try: self.store.update_connection(cid, {'status': status})
+                except BridgeError: pass
+            value.pop('assistant_archived', None)
+            value['enabled'] = record.get('enabled', False)
+            atomic_write(path, value)
+            archives.pop(ref, None)
+            atomic_write(self.bot_archives_path, archives)
             return self.catalog()
 
     def save_app(self, data, manager_admin=None, *, prompt_policy_version=None):
@@ -567,6 +666,8 @@ class GroupSettings:
         if path == '/api/feishu/accounts/restore' and method == 'POST':return self.restore_account(data)
         if path == '/api/feishu/apps/backend' and method == 'POST':return self.set_app_backend(data)
         if path == '/api/feishu/apps/enabled' and method == 'POST':return self.set_app_enabled(data)
+        if path == '/api/feishu/apps/remove' and method == 'POST':return self.remove_app(data)
+        if path == '/api/feishu/apps/restore' and method == 'POST':return self.restore_app(data)
         if path == '/api/feishu/apps' and method=='POST':
             ref=self.save_app(data, prompt_policy_version=1 if not data.get('ref') else None)
             return {**self.catalog(),'saved_app_ref':ref}

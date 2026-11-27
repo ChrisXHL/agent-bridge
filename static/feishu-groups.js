@@ -1,7 +1,7 @@
 /* Multiple group configurations, with credentials kept at application level. */
 (() => {
  const node=id=>document.getElementById(id), safe=esc;
- const vm={catalog:{apps:[],groups:[],archived_accounts:[]},busy:false,group:null,app:null,linkJobId:null,accountId:null,accountToRemove:null,botToDisable:null,exportRef:null,groupDirty:false,appDirty:false,importKind:null,section:sessionStorage.getItem('feishuSection')==='assistants'?'assistants':'accounts'};
+ const vm={catalog:{apps:[],groups:[],archived_accounts:[]},busy:false,group:null,app:null,linkJobId:null,accountId:null,accountToRemove:null,botToDisable:null,botToDelete:null,exportRef:null,groupDirty:false,appDirty:false,importKind:null,section:sessionStorage.getItem('feishuSection')==='assistants'?'assistants':'accounts'};
  const area=node('groupsWorkspace');
  function showSection(section){
   vm.section=section;sessionStorage.setItem('feishuSection',section);
@@ -83,7 +83,7 @@
    const title=safe(account.name||(account.verified?account.apps[0].value.name+' 所在账号':account.apps[0].value.name+' 的账号待确认'));
    const visibleApps=account.apps.filter(({value:a})=>!query||account.name.toLocaleLowerCase().includes(query)||a.name.toLocaleLowerCase().includes(query));
    if(query&&!visibleApps.length)return '';
-  const bots=visibleApps.map(({value:a,index:i})=>{const status=botStatus(a);return `<div class="account-item account-bot"><div class="account-item-main"><strong>${safe(a.name)}</strong><span class="status ${status.tone}">${safe(status.label)}</span></div><p class="bot-folder" title="${safe(a.project_path||'')}">工作文件夹：${safe(a.project_name||'未设置')}</p><div class="account-bot-actions"><label>任务执行 <select class="select bot-backend" data-backend-app="${safe(a.ref)}" aria-label="${safe(a.name)}的任务执行工具"><option value="codex" ${a.execution_backend==='claude'?'':'selected'}>Codex CLI · GPT</option><option value="claude" ${a.execution_backend==='claude'?'selected':''}>Claude Code CLI</option></select></label><div class="account-bot-buttons"><button class="btn ghost" data-edit-app="${i}">设置</button><button class="btn ghost" data-export-bot="${safe(a.ref)}" ${a.migration_supported?'':'disabled title="此类助手需要单独迁移管理记录"'}>导出配置</button><button class="btn ghost" data-toggle-bot="${safe(a.ref)}">${a.enabled?'停用':'重新启用'}</button></div></div>${vm.botToDisable===a.ref&&a.enabled?`<div class="bot-disable-confirm" role="group" aria-label="确认停用${safe(a.name)}"><p>停用后，这个机器人将停止接收飞书消息；已有任务和记录保留。正在处理的任务不会取消，停用期间暂不回传结果。</p><div><button class="btn" data-cancel-disable-bot="${safe(a.ref)}">取消</button><button class="btn primary" data-confirm-disable-bot="${safe(a.ref)}">确认停用</button></div></div>`:''}</div>`;}).join('');
+  const bots=visibleApps.map(({value:a,index:i})=>{const status=botStatus(a);return `<div class="account-item account-bot"><div class="account-item-main"><strong>${safe(a.name)}</strong><span class="status ${status.tone}">${safe(status.label)}</span></div><p class="bot-folder" title="${safe(a.project_path||'')}">工作文件夹：${safe(a.project_name||'未设置')}</p><div class="account-bot-actions"><label>任务执行 <select class="select bot-backend" data-backend-app="${safe(a.ref)}" aria-label="${safe(a.name)}的任务执行工具"><option value="codex" ${a.execution_backend==='claude'?'':'selected'}>Codex CLI · GPT</option><option value="claude" ${a.execution_backend==='claude'?'selected':''}>Claude Code CLI</option></select></label><div class="account-bot-buttons"><button class="btn ghost" data-edit-app="${i}">设置</button><button class="btn ghost" data-export-bot="${safe(a.ref)}" ${a.migration_supported?'':'disabled title="此类助手需要单独迁移管理记录"'}>导出配置</button><button class="btn ghost" data-toggle-bot="${safe(a.ref)}">${a.enabled?'停用':'重新启用'}</button><button class="btn ghost" data-delete-bot="${safe(a.ref)}">删除</button></div></div>${vm.botToDelete===a.ref?`<div class="bot-disable-confirm" role="group" aria-label="确认删除${safe(a.name)}"><p>删除后，这个机器人不再接收飞书消息，它的群连接也会停用。历史任务和工作文件夹保留，可在下方「已删除的机器人」恢复；飞书里的应用不会被删除。</p><div><button class="btn" data-cancel-delete-bot="${safe(a.ref)}">取消</button><button class="btn primary" data-confirm-delete-bot="${safe(a.ref)}">确认删除</button></div></div>`:''}${vm.botToDisable===a.ref&&a.enabled?`<div class="bot-disable-confirm" role="group" aria-label="确认停用${safe(a.name)}"><p>停用后，这个机器人将停止接收飞书消息；已有任务和记录保留。正在处理的任务不会取消，停用期间暂不回传结果。</p><div><button class="btn" data-cancel-disable-bot="${safe(a.ref)}">取消</button><button class="btn primary" data-confirm-disable-bot="${safe(a.ref)}">确认停用</button></div></div>`:''}</div>`;}).join('');
    const chats=new Map();
    account.groups.forEach(route=>{const id=route.value.chat_id;if(!chats.has(id))chats.set(id,[]);chats.get(id).push(route);});
    const groups=Array.from(chats.values()).map(routes=>{
@@ -96,10 +96,14 @@
   }).join('')||(query?'<section class="empty-card"><h2>没有找到匹配的机器人</h2><p>换个名称试试。</p></section>':'<section class="empty-card"><h2>还没有接入机器人</h2><p>可以在上方创建助手，或接入已有机器人。</p></section>');
   const archived=vm.catalog.archived_accounts||[];
   const archivedHtml=archived.length?`<details id="archivedAccounts" class="archived-accounts"><summary>已移除的账号（${archived.length}）</summary>${archived.map(a=>`<div class="archived-account"><div><strong>${safe(a.name)}</strong><p>${a.app_count} 个机器人 · ${a.group_count} 条群连接</p></div><button class="btn ghost" data-restore-account="${safe(a.account_id)}" ${a.state==='removed'?'':'disabled'}>${a.state==='removed'?'恢复账号':'处理中'}</button></div>`).join('')}</details>`:'';
+  const removedBots=vm.catalog.removed_apps||[];
+  const removedBotsHtml=removedBots.length?`<details id="removedBots" class="archived-accounts"><summary>已删除的机器人（${removedBots.length}）</summary>${removedBots.map(a=>`<div class="archived-account"><div><strong>${safe(a.name)}</strong></div><button class="btn ghost" data-restore-bot="${safe(a.ref)}">恢复</button></div>`).join('')}</details>`:'';
+  const removedBotsOpen=node('removedBots')?.open||false;
   const wasOpen=node('archivedAccounts')?.open||false;
   const openGroups=new Set(Array.from(area.querySelectorAll('details[data-account-groups]')).filter(x=>x.open).map(x=>x.dataset.accountGroups));
-  setHtmlIfChanged('groupList',accountHtml+archivedHtml);
+  setHtmlIfChanged('groupList',accountHtml+removedBotsHtml+archivedHtml);
   if(node('archivedAccounts'))node('archivedAccounts').open=wasOpen;
+  if(node('removedBots'))node('removedBots').open=removedBotsOpen;
   area.querySelectorAll('details[data-account-groups]').forEach(x=>x.open=openGroups.has(x.dataset.accountGroups));
   node('appCount').textContent=`（${vm.catalog.apps.length}）`;
  }
@@ -256,6 +260,22 @@
    report('groupsNotice',enabled?`「${a.name}」已重新启用，正在连接飞书。`:`「${a.name}」已停用，其他机器人不受影响。`);
   }catch(err){report('groupsNotice',err.message,true);}});
  }
+ async function deleteBot(ref){
+  const a=app(ref);if(!a||vm.busy)return;
+  await operation(async()=>{try{
+   vm.catalog=await api('/api/feishu/apps/remove',{method:'POST',body:JSON.stringify({app_ref:a.ref,revision:a.revision})});
+   vm.botToDelete=null;lists();window.dispatchEvent(new CustomEvent('bridge:assistants-changed'));
+   report('groupsNotice',`「${a.name}」已删除，可在下方「已删除的机器人」恢复。`);
+  }catch(err){vm.botToDelete=null;lists();report('groupsNotice',err.message,true);}});
+ }
+ async function restoreBot(ref){
+  if(vm.busy)return;const name=(vm.catalog.removed_apps||[]).find(x=>x.ref===ref)?.name||'机器人';
+  await operation(async()=>{try{
+   vm.catalog=await api('/api/feishu/apps/restore',{method:'POST',body:JSON.stringify({app_ref:ref})});
+   lists();window.dispatchEvent(new CustomEvent('bridge:assistants-changed'));
+   report('groupsNotice',`「${name}」已恢复。`);
+  }catch(err){report('groupsNotice',err.message,true);}});
+ }
  async function exportBots(selected,feedbackId,fileBase){
   if(vm.busy)return;
   vm.busy=true;report(feedbackId,'正在准备配置包…');
@@ -295,6 +315,10 @@
   if(b.dataset.exportBot!==undefined){const a=app(b.dataset.exportBot);if(a&&a.migration_supported){vm.exportRef=a.ref;node('exportConfigName').textContent=`${a.name}：选择要下载的内容`;report('exportConfigFeedback');node('exportConfigDialog').showModal();node('cancelExportConfig').focus();}return;}
   if(b.dataset.toggleBot!==undefined){const a=app(b.dataset.toggleBot);if(!a)return;if(a.enabled){vm.botToDisable=a.ref;lists();area.querySelector('[data-confirm-disable-bot="'+CSS.escape(a.ref)+'"]')?.focus();}else toggleBot(a.ref,true);return;}
   if(b.dataset.cancelDisableBot!==undefined){vm.botToDisable=null;lists();return;}
+  if(b.dataset.deleteBot!==undefined){vm.botToDelete=b.dataset.deleteBot;vm.botToDisable=null;lists();area.querySelector('[data-confirm-delete-bot="'+CSS.escape(b.dataset.deleteBot)+'"]')?.focus();return;}
+  if(b.dataset.cancelDeleteBot!==undefined){vm.botToDelete=null;lists();return;}
+  if(b.dataset.confirmDeleteBot!==undefined){deleteBot(b.dataset.confirmDeleteBot);return;}
+  if(b.dataset.restoreBot!==undefined){restoreBot(b.dataset.restoreBot);return;}
   if(b.dataset.confirmDisableBot!==undefined){toggleBot(b.dataset.confirmDisableBot,false);return;}
   if(b.dataset.editGroup!==undefined)groupEditor(vm.catalog.groups[Number(b.dataset.editGroup)]);if(b.dataset.editApp!==undefined)applicationEditor(vm.catalog.apps[Number(b.dataset.editApp)]);if(b.dataset.nameAccount!==undefined){vm.accountId=b.dataset.nameAccount;const a=vm.catalog.apps.find(x=>x.account_id===vm.accountId);node('accountNameInput').value=a?.account_name||'';report('accountNameFeedback');node('accountNameDialog').showModal();node('accountNameInput').focus();}if(b.dataset.removeAccount!==undefined){const apps=vm.catalog.apps.filter(a=>a.account_id===b.dataset.removeAccount);if(!apps.length)return;const name=apps[0].account_name||apps[0].name+' 所在账号';vm.accountToRemove={account_id:b.dataset.removeAccount,expected:apps.map(a=>({ref:a.ref,revision:a.revision}))};node('accountRemoveDescription').textContent=`从 Bridge 移除「${name}」及其 ${apps.length} 个机器人、${vm.catalog.groups.filter(g=>apps.some(a=>a.ref===g.app_ref)).length} 条群连接？`;node('accountRemoveDialog').showModal();node('cancelAccountRemove').focus();}if(b.dataset.restoreAccount!==undefined){operation(async()=>{try{vm.catalog=await api('/api/feishu/accounts/restore',{method:'POST',body:JSON.stringify({account_id:b.dataset.restoreAccount})});lists();window.dispatchEvent(new CustomEvent('bridge:assistants-changed'));report('groupsNotice','账号已恢复，机器人正在重新连接飞书。');}catch(err){report('groupsNotice',err.message,true);}});}});
  area.addEventListener('change',async e=>{

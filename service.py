@@ -38,7 +38,7 @@ from feishu_worker import Inbox
 from legacy_history import LegacyHistory
 from assistant_onboarding import AssistantOnboarding
 from assistant_manager import AssistantManager
-from assistant_collaboration import AssistantCollaboration, install as install_collaboration, CHILD_SLOTS
+from assistant_collaboration import AssistantCollaboration, install as install_collaboration, COLLABORATION_WAITING
 
 LOG = logging.getLogger("codex_bridge")
 ROOT = Path(__file__).resolve().parent
@@ -586,6 +586,8 @@ class Store:
                 task = db.execute("SELECT * FROM tasks WHERE id=? AND connection_id=?", (requested_task, cid)).fetchone()
                 if not task:
                     raise BridgeError(404, "task_not_found", "这个连接中没有该任务")
+                if task['error_code'] == COLLABORATION_WAITING:
+                    raise BridgeError(409,'conversation_busy','原任务还在等协作结果，请稍后续接')
                 task_id = task["id"]
             else:
                 thread_id = None
@@ -764,6 +766,8 @@ class Engine:
             self.archived_tasks = self.history.tasks()
             self._reconcile_uncertain()
             self._refresh()
+            if self.collaboration:
+                self.collaboration.resume_waiting_results()
             self._deliver_one()
         finally:
             self.lock.release()
@@ -887,7 +891,8 @@ class Engine:
                 if self.collaboration and self.collaboration.topics.pause_for_question(row['id']):
                     continue
                 if self.collaboration and not self.collaboration.all_collected(row['id']):
-                    if not self.collaboration.pause_for_authorization(row['id']):
+                    if (not self.collaboration.pause_for_authorization(row['id'])
+                            and not self.collaboration.pause_for_results(row['id'])):
                         self.store.set_task(row['id'],'失败','主助手提前结束，尚未收齐协作结果，请查看子任务状态。','collaboration_incomplete')
                 else:self.store.set_task(row["id"], "已完成", final)
             elif state == "failed":
@@ -959,7 +964,7 @@ class Engine:
                     b=r['backend'] if r['backend'] in BACKENDS else 'codex'
                     active[b]+=1
         return {'backends':[{'id':b,'name':BACKEND_NAMES[b],'limit':limits[b],'active':active[b]} for b in BACKENDS],
-                'max':MAX_CONCURRENCY,'default':self.max_active}
+                'max':MAX_CONCURRENCY,'default':self.max_active,'child_tasks_unlimited':True}
 
     def set_concurrency(self, data):
         if not isinstance(data,dict) or not isinstance(data.get('limits'),dict) or set(data)!={'limits'}:
@@ -981,17 +986,22 @@ class Engine:
             # An unresolved delivery receipt is not a running turn. Preserve
             # the record; actual Codex approvals still reserve their slot.
             active_rows=self._active_rows(db)
-            active_by_depth={depth:sum(r['id'] not in self.archived_tasks and r['depth']==depth for r in active_rows) for depth in range(1,4)}
             active_by_backend={}
             for r in active_rows:
-                if r['id'] not in self.archived_tasks and not r['depth'] and not r['private']:
-                    b=r['backend'] if r['backend'] in BACKENDS else 'codex';active_by_backend[b]=active_by_backend.get(b,0)+1
+                if r['id'] in self.archived_tasks:
+                    continue
+                backend=r['backend'] if r['backend'] in BACKENDS else 'codex'
+                if not r['depth'] and not r['private']:
+                    active_by_backend[backend]=active_by_backend.get(backend,0)+1
             limits=self._limits(db)
             rows = db.execute("""SELECT m.*,t.thread_id,t.status AS task_status,t.execution_backend,t.private,c.project_id,
                 COALESCE((SELECT depth FROM assistant_calls a WHERE a.child_task=t.id),0) AS depth
                 FROM messages m JOIN tasks t ON t.id=m.task_id JOIN connections c ON c.id=t.connection_id
-                WHERE m.delivery='queued' AND (c.status!='已停用' OR EXISTS(SELECT 1 FROM assistant_calls a WHERE a.child_task=t.id))
-                AND NOT EXISTS (SELECT 1 FROM messages older WHERE older.task_id=m.task_id AND older.created_at<m.created_at AND older.delivery IN ('queued','sending','uncertain'))
+                WHERE m.delivery='queued' AND t.error_code IS NOT 'collaboration_waiting' AND (c.status!='已停用' OR EXISTS(SELECT 1 FROM assistant_calls a WHERE a.child_task=t.id))
+                AND NOT EXISTS (SELECT 1 FROM messages older WHERE older.task_id=m.task_id AND older.created_at<m.created_at
+                    AND older.delivery IN ('queued','sending','uncertain')
+                    AND NOT (older.delivery='queued' AND EXISTS (SELECT 1 FROM assistant_resume_messages resume
+                        WHERE resume.message_id=m.id AND resume.resume_key GLOB 'collaboration-*')))
                 ORDER BY EXISTS(SELECT 1 FROM assistant_resume_messages r WHERE r.message_id=m.id) DESC,m.created_at""").fetchall()
         for row in rows:
             if row['task_id'] in self.archived_tasks:
@@ -999,10 +1009,8 @@ class Engine:
             if row['execution_backend'] == 'codex' and not self._codex_desktop_open():
                 continue
             if self.collaboration and not self.collaboration.may_deliver(dict(row)):continue
-            if row['depth']:
-                if active_by_depth.get(row['depth'],0)>=CHILD_SLOTS:continue
-            elif not row['private']:
-                backend=row['execution_backend'] if row['execution_backend'] in BACKENDS else 'codex'
+            backend=row['execution_backend'] if row['execution_backend'] in BACKENDS else 'codex'
+            if not row['depth'] and not row['private']:
                 if active_by_backend.get(backend,0)>=limits[backend]:continue
             if self._deliver_message(dict(row)):
                 return
@@ -1221,7 +1229,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                     from bridge_setup import VERSION
                     return self.send_json(200,{'product':'codex-bridge','version':VERSION,
                         'source_root':str(ROOT.resolve()),'state_dir':str(Path(store.db_path).resolve().parent),
-                        'features':['signed-assistant-source-v1','group-recipient-v1','scheduled-group-handoff-v1','native-group-mention-v1','personal-preferences-v1','task-source-label-v1']})
+                        'features':['signed-assistant-source-v1','group-recipient-v1','scheduled-group-handoff-v1','native-group-mention-v1','personal-preferences-v1','task-source-label-v1','collaboration-wait-resume-v1','collaboration-unlimited-child-tasks-v1']})
                 if path == "/api/platforms" or path.startswith("/api/platforms/"):
                     if allowed_host is not None or self.client_address[0] not in ("127.0.0.1", "::1"):
                         raise BridgeError(403, "local_only", "平台设置只能在本机修改")
@@ -1314,7 +1322,7 @@ def make_handler(store, engine, base_url, allowed_host=None,
                             return self.serve_file(image, 'image/png')
                         data = self.read_json() if self.command == 'POST' else None
                         return self.send_json(200, onboarding.dispatch(path,self.command,data))
-                    if path in ('/api/feishu/catalog','/api/feishu/accounts','/api/feishu/accounts/remove','/api/feishu/accounts/restore','/api/feishu/apps','/api/feishu/apps/backend','/api/feishu/apps/enabled','/api/feishu/groups','/api/feishu/app-pairing','/api/feishu/group-defaults','/api/feishu/migration/export','/api/feishu/migration/import','/api/feishu/migration/stop','/api/feishu/assistant-template/export','/api/feishu/assistant-template/apply'):
+                    if path in ('/api/feishu/catalog','/api/feishu/accounts','/api/feishu/accounts/remove','/api/feishu/accounts/restore','/api/feishu/apps','/api/feishu/apps/backend','/api/feishu/apps/enabled','/api/feishu/apps/remove','/api/feishu/apps/restore','/api/feishu/groups','/api/feishu/app-pairing','/api/feishu/group-defaults','/api/feishu/migration/export','/api/feishu/migration/import','/api/feishu/migration/stop','/api/feishu/assistant-template/export','/api/feishu/assistant-template/apply'):
                         if not group_settings: raise BridgeError(503,'feishu_unavailable','飞书配置不可用')
                         data = self.read_json() if self.command == 'POST' else None
                         return self.send_json(200, group_settings.dispatch(path,self.command,data))

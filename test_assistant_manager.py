@@ -1,6 +1,7 @@
 import json
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 import test_assistant_onboarding as fixtures
 from assistant_manager import AssistantManager, HELP, interpret
@@ -180,3 +181,43 @@ class ManagerTests(unittest.TestCase):
   self.assertIn('applink.feishu.cn',self.sender.sent[-1][2]);self.assertEqual(self.bridge.submissions,[])
 
 if __name__=='__main__':unittest.main()
+
+
+class DefaultScopeTests(unittest.TestCase):
+    def test_new_assistants_request_all_group_messages_by_default(self):
+        import assistant_onboarding
+        self.assertIn('im:message.group_msg',assistant_onboarding.SCOPES)
+
+    def test_manager_preference_scopes_are_extracted(self):
+        from assistant_manager import preferred_scopes
+        self.assertEqual(preferred_scopes('以后默认开通 im:message.group_msg、docx:document:readonly'),
+                         ['im:message.group_msg','docx:document:readonly'])
+        self.assertEqual(preferred_scopes('命名用中文'),[])
+
+
+class DelegateTests(unittest.TestCase):
+    def test_manager_receipt_becomes_prompt_task_once(self):
+        import tempfile,json
+        from feishu_worker import Inbox,prompt_source
+        with tempfile.TemporaryDirectory() as d:
+            inbox=Inbox(Path(d)/'inbox.sqlite3')
+            inbox.accept({'message_id':'om_1','chat_id':'oc_1','sender_id':'ou_a','text':'帮我开通群消息权限','prompt':'完整提示',
+                          'app_id':'cli_m','connection_id':'conn_m','chat_type':'p2p',
+                          'route_json':json.dumps({'mode':'assistant_manager','delegate_route':{'mode':'prompt','connection_id':'conn_m'}})})
+            self.assertFalse(prompt_source(inbox.pending()[0]))
+            self.assertTrue(inbox.delegate('om_1'))
+            self.assertTrue(prompt_source(inbox.pending()[0]))
+            self.assertTrue(inbox.delegate('om_1'))
+
+    def test_old_receipt_without_prompt_is_not_delegated(self):
+        import tempfile,json
+        from feishu_worker import Inbox
+        with tempfile.TemporaryDirectory() as d:
+            inbox=Inbox(Path(d)/'inbox.sqlite3')
+            inbox.accept({'message_id':'om_2','chat_id':'oc_1','sender_id':'ou_a','text':'x','prompt':'',
+                          'app_id':'cli_m','chat_type':'p2p','route_json':json.dumps({'mode':'assistant_manager'})})
+            self.assertFalse(inbox.delegate('om_2'))
+
+    def test_classifier_offers_delegate(self):
+        import assistant_manager
+        self.assertIn('delegate',assistant_manager.SCHEMA['properties']['action']['enum'])

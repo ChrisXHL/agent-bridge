@@ -25,6 +25,7 @@ import uuid
 from pathlib import Path
 from urllib import error, request
 from urllib.parse import quote
+from assistant_prompt import autonomy_principles
 
 LOG = logging.getLogger("codex_bridge.weixin")
 ROOT = Path(__file__).resolve().parent
@@ -516,7 +517,7 @@ class WeixinChannel:
             return self._send(row, "好的，已开始新对话。", a)
         self._connection(a["id"])
         a = self.account(a["id"])
-        message = (a.get("prompt") or "{{message}}").replace("{{message}}", row["text"]) + self._rule_instruction(a, row)
+        message = (a.get("prompt") or "{{message}}").replace("{{message}}", row["text"]) + autonomy_principles() + self._rule_instruction(a, row)
         payload = {"message": message[:12000], "request_id": "wx-" + re.sub(r"[^\w.:-]", "", row["message_id"])[-100:],
                    "private": True}
         if conv and conv["last_task"] and conv["connection_id"] == a.get("connection_id"):

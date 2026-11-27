@@ -380,7 +380,7 @@ function renderFeishuOverview() {
 
 function concurrencyHtml(c){
  const rows=c.backends.map(b=>`<div class="concurrency-row"><div class="project-info"><strong>${esc(b.name)}</strong><span>正在执行 ${b.active} 个</span></div><div class="concurrency-stepper"><button class="btn" type="button" data-conc-step="-1" data-backend="${esc(b.id)}" aria-label="减少 ${esc(b.name)} 并发">−</button><input class="input" type="number" min="1" max="${c.max}" step="1" id="conc_${esc(b.id)}" value="${b.limit}" aria-label="${esc(b.name)} 最多同时执行"><button class="btn" type="button" data-conc-step="1" data-backend="${esc(b.id)}" aria-label="增加 ${esc(b.name)} 并发">+</button></div></div>`).join('');
- return `<h2 class="detail-title">并发设置</h2><p class="config-help">每个执行工具最多同时执行多少个任务。超出的任务会显示「等待 …」，有空位后按顺序开始。私聊消息不受限制、也不占用名额，只有群聊等其他任务排队。助手之间的协作子任务另有名额，不占用这里的数量。</p><div class="concurrency-list">${rows}</div><p class="config-help">范围 1–${c.max}。调小不会中断正在执行的任务，只影响之后开始的任务。</p><button class="btn primary" type="button" id="saveConcurrency">保存</button>`;
+ return `<h2 class="detail-title">并发设置</h2><p class="config-help">分别设置每个执行工具能同时跑几个主任务。群聊等主任务有空位再开始。私聊不占用名额。${c.child_tasks_unlimited ? '助手之间的协作子任务不限并发，也不占这里的名额。' : '助手之间的协作子任务另有名额，不占用这里的数量。'}</p><div class="concurrency-list">${rows}</div><p class="config-help">范围 1–${c.max}。调小不会中断正在执行的任务，只影响之后开始的任务。</p><button class="btn primary" type="button" id="saveConcurrency">保存</button>`;
 }
 async function showConcurrency(){
  feedback('drawerFeedback');

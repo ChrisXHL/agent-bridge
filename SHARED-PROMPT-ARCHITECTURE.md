@@ -36,3 +36,7 @@
 - 干净解包验证：规则更新、定时、个人偏好与迁移入口四项 `--help` 成功，包内不含运行状态。
 
 测试与连接状态不等于飞书端到端验收。本次没有伪造用户事件，也未擅自向群发送测试消息；下一条真实消息的处理/回传需单独核验。
+
+## 基础工作原则（所有助手通用）
+
+`assistant_prompt.AUTONOMY_PRINCIPLES`（自主执行与权限原则）在运行时注入每一条助手任务：飞书私聊/群聊（`feishu_worker`，位于业务 Prompt 之后、追加规则之前，属于可压缩的静态规则）、定时任务（`assistant_schedules`）、助手间协作子任务（`assistant_collaboration`）、微信与其他平台插件（`weixin_bridge`、`platform_channel`）。它不写进任何助手自己的 Prompt，因此现有和以后新建的助手都自动具备，修改只需改这一处。

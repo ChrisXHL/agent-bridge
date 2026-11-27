@@ -15,6 +15,7 @@ from codex_http_bridge import BridgeError
 from feishu_settings import load, save
 from feishu_worker import BridgeClient, FeishuAdapter, Inbox
 from service import Store, make_handler
+from assistant_prompt import AUTONOMY_PRINCIPLES
 
 
 def event(message_id, text, *, sender="ou_owner", chat="oc_private", chat_type="p2p",
@@ -154,7 +155,7 @@ class FeishuScenarioTests(unittest.TestCase):
         task = self.store.tasks()[0]
         self.assertEqual(task["status"], "等待 Codex")
         content=self.store.task(task["id"])["messages"][0]["content"]
-        self.assertTrue(content.startswith("固定规则：检查项目\n\n[Codex Bridge 来源信息"))
+        self.assertTrue(content.startswith("固定规则：检查项目" + AUTONOMY_PRINCIPLES + "\n\n[Codex Bridge 来源信息"))
         self.assertIn('"source_message_id": "om_task"', content)
         self.assertNotIn("bridge_send_card",content)
 

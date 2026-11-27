@@ -17,7 +17,7 @@ from codex_http_bridge import BridgeError
 from feishu_groups import group_routes
 from feishu_settings import (DEFAULT_PROMPT_TEMPLATE, validate_prompt_template,
                              compose_prompt, bounded_task_prompt)
-from assistant_prompt import business_template, delivery_context, is_shared
+from assistant_prompt import autonomy_principles, business_template, delivery_context, is_shared
 from assistant_self_update import applied_rule, owner_for, request_text
 from assistant_source import resolve_source
 from feishu_worker import Inbox
@@ -112,7 +112,7 @@ def _task_template(config, group, chat_type, chat_id, sender_id):
     group = group if chat_type == 'group' else {}
     fallback = group.get('prompt_template') or config.get('prompt_template', DEFAULT_PROMPT_TEMPLATE)
     base = validate_prompt_template(business_template(config, fallback))
-    return (base + applied_rule(config, chat_id if chat_type == 'group' else None)
+    return (base + autonomy_principles() + applied_rule(config, chat_id if chat_type == 'group' else None)
             + delivery_context(config, chat_type, chat_id, sender_id)
             + '\n\n[Bridge 定时触发] 现在执行以上工作并交付结果。定时已由 Bridge 管理，不要再次创建定时。')
 

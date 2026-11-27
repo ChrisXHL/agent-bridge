@@ -24,7 +24,7 @@ SCOPES = ['docx:document:create','docx:document:write_only','docx:document:reado
           'docs:document.media:upload','base:app:create','base:app:read','base:table:read',
           'base:table:create','drive:file:upload','drive:drive.metadata:readonly',
           'docs:permission.member:create','im:message.p2p_msg:readonly',
-          'im:message.group_at_msg:readonly','im:message:send_as_bot','im:resource','im:message:readonly',
+          'im:message.group_at_msg:readonly','im:message.group_msg','im:message:send_as_bot','im:resource','im:message:readonly',
           'im:chat.members:bot_access','im:chat:readonly']
 EXISTING_SCOPES = ['im:message.p2p_msg:readonly','im:message.group_at_msg:readonly','im:message.group_msg',
                    'im:message:send_as_bot','im:message:readonly','im:resource',
@@ -152,7 +152,7 @@ def other_local_receiver(app_id, own_state_dir):
 
 class AssistantOnboarding:
     def __init__(self, groups, planner=plan_with_codex):
-        self.groups=groups;self.store=groups.store;self.planner=planner
+        self.groups=groups;self.store=groups.store;self.planner=planner;groups.onboarding=self
         self.root=groups.config_path.parent/'assistant-onboarding';self.root.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.lock=threading.RLock();self.workers={};self.stop=threading.Event()
 
@@ -403,7 +403,8 @@ class AssistantOnboarding:
                     self.update(ident,phase='needs_check',message=('尚未取得连接结果，可以重新扫码选择已有机器人。' if j.get('kind')=='existing' else '尚未取得创建结果。请先确认飞书是否已经创建成功。'));return
                 scopes=(EXISTING_SCOPES if j.get('kind')=='existing' else
                         ['im:message.p2p_msg:readonly','im:message:send_as_bot'] if j.get('kind')=='manager'
-                        else SCOPES+(['im:message.group_msg'] if j['audience']=='group' else []))
+                        else SCOPES)
+                scopes=list(dict.fromkeys(scopes+[x for x in j.get('extra_scopes') or [] if isinstance(x,str)]))
                 atomic_write(directory/'registration-input.json',{'mode':'existing' if j.get('kind')=='existing' else 'create',
                     'app_id':j.get('expected_app_id',''),
                     'name':j['name'],'summary':j['summary'],'scopes':scopes})
